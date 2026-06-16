@@ -122,8 +122,8 @@ async fn main() {
 
     std::fs::create_dir_all(DOWNLOAD_DIR).ok();
     std::fs::create_dir_all(&cfg.media_dir).ok();
-    log(format!("cache (tijdelijk): ./{DOWNLOAD_DIR}/"));
-    log(format!("mediabibliotheek (permanent): ./{}/", cfg.media_dir));
+    log(format!("cache (tijdelijk): {DOWNLOAD_DIR}/"));
+    log(format!("mediabibliotheek (permanent): {}/", cfg.media_dir));
     if cfg.cache_ttl_secs == 0 {
         log("cache TTL: uit — tijdelijke bestanden worden niet opgeruimd".to_string());
     } else {

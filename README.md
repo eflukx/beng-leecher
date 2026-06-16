@@ -12,7 +12,12 @@ multi-select of the playable episodes so you can grab a whole season at once.
 
 ---
 
+> 🐳 **Just want to run it?** Skip to [Running with Docker](#running-with-docker)
+> — the image bundles ffmpeg, so you don't need anything but Docker.
+
 ## Requirements
+
+For a local (non-Docker) build:
 
 - **Rust** (edition 2024 — stable 1.85+).
 - **ffmpeg** and **ffprobe** available on your `PATH`.
@@ -83,6 +88,36 @@ By default the server binds to `0.0.0.0:3380`, i.e. **all network interfaces**,
 so it's reachable from other machines on your network — not just loopback. Use
 `-a 127.0.0.1:3380` for local-only access. Note the server has **no
 authentication**, so only expose it on networks you trust.
+
+## Running with Docker
+
+A `docker-compose.yml` and a `Dockerfile` are included. The image needs nothing
+on the host but Docker — **ffmpeg is bundled** inside it.
+
+```bash
+docker compose build      # build the image
+docker compose up -d      # start it in the background
+```
+
+Then open <http://localhost:3380>. Cache and media library are persisted to
+`./data/` on the host (`./data/downloads` and `./data/media`); the listen
+address, media dir and cache TTL are set via the `command:` in the compose file.
+
+### How the image is built
+
+The `Dockerfile` produces a **`FROM scratch`** image — no base OS, just two
+static binaries — via a multi-stage build:
+
+1. **Build stage** (`rust:alpine`) compiles a fully static **musl** binary. The
+   TLS stack is rustls + ring with Mozilla roots (`webpki-roots`) compiled into
+   the binary, so there's no OpenSSL and no CA-certificate files are needed at
+   runtime.
+2. **ffmpeg stage** pulls statically-linked `ffmpeg`/`ffprobe` from
+   `mwader/static-ffmpeg` — these run in `scratch` with no shared libraries.
+3. **Runtime stage** is `scratch`: it copies in the app binary and the two
+   ffmpeg binaries, sets `PATH=/usr/bin` (so `Command::new("ffmpeg")` resolves),
+   and runs the server. The whole thing works without a libc, shell, or any
+   distro packages.
 
 ## Downloading a whole series
 

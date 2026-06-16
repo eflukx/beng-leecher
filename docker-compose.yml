@@ -1,0 +1,12 @@
+services:
+  beng_leecher:
+    build: .
+    image: beng_leecher
+    container_name: beng_leecher
+    ports:
+      - "3380:3380"
+    volumes:
+      # Persist the cache (./data/downloads) and media library (./data/media).
+      - ./data:/data
+    command: ["-a", "0.0.0.0:3380", "-m", "/data/media", "-t", "60m"]
+    restart: unless-stopped
