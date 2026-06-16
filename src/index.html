@@ -8,12 +8,13 @@
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
   body {
-    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    margin: 0; min-height: 100vh; display: flex; align-items: flex-start; justify-content: center;
+    padding: 6vh 0;
     font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
     background: radial-gradient(circle at 30% 20%, #1d2b4a, #0b1020 70%); color: #e7ecf5;
   }
   .card {
-    width: min(560px, 92vw); background: #141b30; border: 1px solid #283556;
+    width: min(620px, 94vw); background: #141b30; border: 1px solid #283556;
     border-radius: 16px; padding: 28px 30px 32px; box-shadow: 0 20px 60px rgba(0,0,0,.45);
   }
   h1 { margin: 0 0 4px; font-size: 1.35rem; }
@@ -29,85 +30,143 @@
     padding: 12px 18px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 600;
     background: #4c7bff; color: #fff; font-size: .95rem;
   }
+  button.ghost { background: #26334f; color: #cdd6ea; }
+  button.small { padding: 7px 12px; font-size: .8rem; }
   button:disabled { opacity: .5; cursor: default; }
-  .panel { margin-top: 22px; display: none; }
-  .panel.show { display: block; }
-  .status { font-size: .9rem; margin-bottom: 8px; }
-  .bar { height: 10px; background: #0e1426; border-radius: 999px; overflow: hidden; border: 1px solid #2f3d63; }
+  .keep { display: flex; align-items: center; gap: 8px; margin-top: 14px;
+          font-size: .82rem; color: #b6c0da; cursor: pointer; }
+  .keep input { width: 16px; height: 16px; accent-color: #4c7bff; cursor: pointer; }
+
+  /* Job rows */
+  #jobs { margin-top: 22px; display: flex; flex-direction: column; gap: 14px; }
+  .job { background: #0e1426; border: 1px solid #243152; border-radius: 12px; padding: 14px 16px; }
+  .job-title { font-size: .9rem; font-weight: 600; margin-bottom: 6px; word-break: break-word; }
+  .job-status { font-size: .8rem; color: #9fb0d4; margin-bottom: 8px; }
+  .bar { height: 9px; background: #0a0f1f; border-radius: 999px; overflow: hidden; border: 1px solid #2f3d63; }
   .fill { height: 100%; width: 0; background: linear-gradient(90deg, #4c7bff, #6ad1ff); transition: width .3s; }
-  .msg { font-size: .8rem; color: #8a97b8; margin-top: 8px; min-height: 1em; }
-  .done { display: inline-block; margin-top: 16px; padding: 11px 18px; border-radius: 10px;
-          background: #1f9d55; color: #fff; text-decoration: none; font-weight: 600; }
+  .fill.err { background: #ff6060; }
+  .msg { font-size: .76rem; color: #8a97b8; margin-top: 7px; min-height: 1em; }
+  .warn { color: #ffc85c; }
+  .done { display: inline-block; margin-top: 12px; padding: 9px 15px; border-radius: 9px;
+          background: #1f9d55; color: #fff; text-decoration: none; font-weight: 600; font-size: .82rem; }
   .err { color: #ff8080; }
   .drop { border: 1px dashed #2f3d63; border-radius: 10px; }
   .drop.over { border-color: #5b8cff; background: #0e1426; }
   footer { margin-top: 24px; font-size: .72rem; color: #5f6c8f; line-height: 1.5; }
-  .keep { display: flex; align-items: center; gap: 8px; margin-top: 14px;
-          font-size: .82rem; color: #b6c0da; cursor: pointer; }
-  .keep input { width: 16px; height: 16px; accent-color: #4c7bff; cursor: pointer; }
-  .warn { margin-top: 10px; font-size: .8rem; color: #ffc85c; min-height: 1em; }
+
+  /* Modal */
+  .backdrop {
+    position: fixed; inset: 0; background: rgba(5,8,18,.72); backdrop-filter: blur(2px);
+    display: none; align-items: center; justify-content: center; padding: 4vh 4vw; z-index: 10;
+  }
+  .backdrop.show { display: flex; }
+  .modal {
+    width: min(620px, 96vw); max-height: 90vh; display: flex; flex-direction: column;
+    background: #141b30; border: 1px solid #2f3d63; border-radius: 16px; overflow: hidden;
+    box-shadow: 0 24px 70px rgba(0,0,0,.6);
+  }
+  .modal-head { padding: 18px 22px; border-bottom: 1px solid #243152; display: flex;
+                align-items: center; justify-content: space-between; gap: 12px; }
+  .modal-head h2 { margin: 0; font-size: 1.05rem; }
+  .modal-head .x { background: none; padding: 4px 8px; color: #8a97b8; font-size: 1.1rem; }
+  .modal-tools { padding: 12px 22px; display: flex; align-items: center; gap: 10px;
+                 border-bottom: 1px solid #243152; }
+  .modal-tools .count { margin-left: auto; font-size: .82rem; color: #9fb0d4; }
+  .modal-list { overflow-y: auto; padding: 6px 12px; }
+  .ep { display: flex; align-items: center; gap: 11px; padding: 9px 11px; border-radius: 9px;
+        cursor: pointer; user-select: none; }
+  .ep:hover { background: #0e1426; }
+  .ep.sel { background: #16223f; }
+  .ep input { width: 17px; height: 17px; accent-color: #4c7bff; pointer-events: none; }
+  .ep .t { font-size: .9rem; }
+  .ep .n { font-size: .72rem; color: #6f7ea3; min-width: 26px; }
+  .modal-foot { padding: 14px 22px; border-top: 1px solid #243152; display: flex;
+                align-items: center; gap: 12px; }
+  .modal-foot .keep { margin: 0; margin-right: auto; }
+  .hint { padding: 0 22px 12px; font-size: .72rem; color: #5f6c8f; }
 </style>
 </head>
 <body>
   <div class="card">
     <h1>Schatkamer downloader</h1>
-    <p class="sub">Plak of sleep een afleverings-URL van De Schatkamer hierheen.</p>
+    <p class="sub">Plak of sleep een <b>afleverings</b>- of <b>serie</b>-URL van De Schatkamer hierheen.</p>
 
-    <label for="url">Afleverings-URL</label>
+    <label for="url">Afleverings- of serie-URL</label>
     <div class="row drop" id="drop">
-      <input id="url" type="url" placeholder="https://schatkamer.beeldengeluid.nl/serie/…/aflevering/…" autocomplete="off">
+      <input id="url" type="url" placeholder="https://schatkamer.beeldengeluid.nl/serie/…" autocomplete="off">
       <button id="go">Download</button>
     </div>
 
-    <label class="keep" id="keepLabel">
+    <label class="keep">
       <input type="checkbox" id="keep">
       <span id="keepText">Permanent bewaren op de mediaserver</span>
     </label>
 
-    <div class="panel" id="panel">
-      <div class="status" id="status">…</div>
-      <div class="bar"><div class="fill" id="fill"></div></div>
-      <div class="msg" id="msg"></div>
-      <div class="warn" id="warn"></div>
-      <a class="done" id="dl" style="display:none">⬇ Bewaar bestand</a>
-    </div>
+    <div id="jobs"></div>
 
     <footer>
       Alleen voor niet-DRM content. Video en audio worden via ffmpeg samengevoegd tot één MP4-bestand.
+      Bij een serie-URL kun je kiezen welke afleveringen je wilt downloaden.
     </footer>
+  </div>
+
+  <!-- Series multi-select modal -->
+  <div class="backdrop" id="backdrop">
+    <div class="modal">
+      <div class="modal-head">
+        <h2 id="mTitle">Kies afleveringen</h2>
+        <button class="x" id="mClose" title="Sluiten">✕</button>
+      </div>
+      <div class="modal-tools">
+        <button class="ghost small" id="mAll">Alles selecteren</button>
+        <button class="ghost small" id="mNone">Niets</button>
+        <span class="count" id="mCount">0 geselecteerd</span>
+      </div>
+      <p class="hint">Tip: klik een aflevering, houd <b>Shift</b> ingedrukt om een reeks te selecteren.</p>
+      <div class="modal-list" id="mList"></div>
+      <div class="modal-foot">
+        <label class="keep">
+          <input type="checkbox" id="mKeep">
+          <span>Permanent bewaren op de mediaserver</span>
+        </label>
+        <button class="ghost" id="mCancel">Annuleren</button>
+        <button id="mGo">Download</button>
+      </div>
+    </div>
   </div>
 
 <script>
 const $ = id => document.getElementById(id);
-let timer = null;
-const MAX_FAILS = 10;          // ~6s of failed polls before giving up
-let fails = 0;
+const MAX_FAILS = 10;            // ~6s of failed polls before a row gives up
 
-// Fetch retention config to label the "keep on server" option.
+let cacheTtl = 0;
 fetch('/api/config').then(r => r.json()).then(cfg => {
-  const ttlMin = Math.round((cfg.cache_ttl_secs || 0) / 60);
-  const note = cfg.cache_ttl_secs > 0
-    ? `tijdelijke downloads worden na ${ttlMin} min van de server verwijderd`
-    : `tijdelijke downloads blijven op de server staan`;
-  $('keepText').textContent =
-    `Permanent bewaren op de mediaserver (anders: ${note})`;
+  cacheTtl = cfg.cache_ttl_secs || 0;
+  const ttlMin = Math.round(cacheTtl / 60);
+  const note = cacheTtl > 0
+    ? `anders na ${ttlMin} min van de server verwijderd`
+    : `anders blijven ze tijdelijk op de server staan`;
+  $('keepText').textContent = `Permanent bewaren op de mediaserver (${note})`;
 }).catch(() => {});
 
-async function startDownload() {
+const isSeries = u => u.includes('/serie/') && !u.includes('/aflevering/');
+
+// ---- entry point ----------------------------------------------------------
+
+async function onDownload() {
   const url = $('url').value.trim();
   if (!url) return;
-  const keep = $('keep').checked;
+  if (isSeries(url)) {
+    await openSeries(url);
+  } else {
+    enqueue(url, url, $('keep').checked);
+  }
+}
 
-  $('go').disabled = true;
-  $('panel').classList.add('show');
-  $('dl').style.display = 'none';
-  $('status').classList.remove('err');
-  $('warn').textContent = '';
-  $('fill').style.width = '0%';
-  $('status').textContent = 'Starten…';
-  $('msg').textContent = '';
-  fails = 0;
+// ---- single job row -------------------------------------------------------
 
+async function enqueue(url, title, keep) {
+  const row = makeRow(title);
   let id;
   try {
     const r = await fetch('/api/download', {
@@ -118,65 +177,179 @@ async function startDownload() {
     if (!r.ok) throw new Error('HTTP ' + r.status);
     id = (await r.json()).id;
   } catch (e) {
-    fail('Kon download niet starten — backend onbereikbaar.');
+    rowFail(row, 'Kon download niet starten — backend onbereikbaar.');
     return;
   }
-  poll(id, keep);
+  pollRow(row, id, keep);
 }
 
-function poll(id, keep) {
-  clearInterval(timer);
-  timer = setInterval(async () => {
+function makeRow(title) {
+  const el = document.createElement('div');
+  el.className = 'job';
+  el.innerHTML = `
+    <div class="job-title"></div>
+    <div class="job-status">In wachtrij…</div>
+    <div class="bar"><div class="fill"></div></div>
+    <div class="msg"></div>
+    <a class="done" style="display:none">⬇ Bewaar bestand</a>`;
+  el.querySelector('.job-title').textContent = title;
+  $('jobs').prepend(el);
+  return el;
+}
+
+function pollRow(row, id, keep) {
+  const status = row.querySelector('.job-status');
+  const fill = row.querySelector('.fill');
+  const msg = row.querySelector('.msg');
+  const dl = row.querySelector('.done');
+  let fails = 0;
+
+  const timer = setInterval(async () => {
     let j;
     try {
       const r = await fetch('/api/status/' + id);
       if (!r.ok) throw new Error('HTTP ' + r.status);
       j = await r.json();
     } catch (e) {
-      // Connection hiccup: warn and keep retrying up to MAX_FAILS.
-      fails++;
-      if (fails >= MAX_FAILS) {
+      if (++fails >= MAX_FAILS) {
         clearInterval(timer);
-        fail('Verbinding met de server verbroken. Vernieuw de pagina en probeer opnieuw.');
+        rowFail(row, 'Verbinding met de server verbroken.');
         return;
       }
-      $('warn').textContent = `⚠ Geen verbinding met de server… opnieuw proberen (${fails}/${MAX_FAILS})`;
+      msg.className = 'msg warn';
+      msg.textContent = `⚠ Geen verbinding… opnieuw proberen (${fails}/${MAX_FAILS})`;
       return;
     }
-
-    // Recovered from any transient failures.
     fails = 0;
-    $('warn').textContent = '';
+    msg.className = 'msg';
 
-    $('status').textContent = j.status + (j.title ? ' — ' + j.title : '');
-    $('fill').style.width = (j.progress || 0) + '%';
-    $('msg').textContent = j.message || '';
+    status.textContent = j.status;
+    if (j.title) row.querySelector('.job-title').textContent = j.title;
+    fill.style.width = (j.progress || 0) + '%';
+    msg.textContent = j.message || '';
 
     if (j.done) {
       clearInterval(timer);
-      $('go').disabled = false;
       if (j.error) {
-        $('status').classList.add('err');
+        status.className = 'job-status err';
+        fill.classList.add('err');
       } else {
-        $('fill').style.width = '100%';
-        const a = $('dl');
-        a.href = '/api/file/' + id;
-        a.textContent = keep ? '⬇ Ook lokaal opslaan' : '⬇ Bewaar bestand';
-        a.style.display = 'inline-block';
+        fill.style.width = '100%';
+        dl.href = '/api/file/' + id;
+        dl.textContent = keep ? '⬇ Ook lokaal opslaan' : '⬇ Bewaar bestand';
+        dl.style.display = 'inline-block';
       }
     }
   }, 600);
 }
 
-function fail(text) {
-  $('go').disabled = false;
-  $('status').classList.add('err');
-  $('status').textContent = text;
-  $('warn').textContent = '';
+function rowFail(row, text) {
+  const s = row.querySelector('.job-status');
+  s.className = 'job-status err';
+  s.textContent = text;
+  row.querySelector('.fill').classList.add('err');
 }
 
-$('go').addEventListener('click', startDownload);
-$('url').addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
+// ---- series modal ---------------------------------------------------------
+
+let lastIndex = -1;
+
+async function openSeries(url) {
+  $('go').disabled = true;
+  $('go').textContent = 'Laden…';
+  let data;
+  try {
+    const r = await fetch('/api/series', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url })
+    });
+    if (!r.ok) throw new Error(await r.text());
+    data = await r.json();
+  } catch (e) {
+    alert('Kon serie niet laden: ' + (e.message || e));
+    return;
+  } finally {
+    $('go').disabled = false;
+    $('go').textContent = 'Download';
+  }
+
+  $('mTitle').textContent = `Kies afleveringen — ${data.series_title}`;
+  $('mKeep').checked = $('keep').checked;
+  const list = $('mList');
+  list.innerHTML = '';
+  data.episodes.forEach((ep, i) => {
+    const row = document.createElement('label');
+    row.className = 'ep';
+    row.innerHTML = `<input type="checkbox"><span class="n">${i + 1}.</span><span class="t"></span>`;
+    row.querySelector('.t').textContent = ep.title;
+    row.dataset.url = ep.url;
+    row.dataset.title = ep.title;
+    row.addEventListener('click', e => toggleEp(e, i));
+    list.appendChild(row);
+  });
+  lastIndex = -1;
+  updateCount();
+  $('backdrop').classList.add('show');
+}
+
+function epRows() { return [...$('mList').querySelectorAll('.ep')]; }
+
+function toggleEp(e, i) {
+  e.preventDefault();
+  const rows = epRows();
+  const box = rows[i].querySelector('input');
+  const next = !box.checked;
+
+  if (e.shiftKey && lastIndex !== -1) {
+    const [a, b] = [Math.min(lastIndex, i), Math.max(lastIndex, i)];
+    for (let k = a; k <= b; k++) setSel(rows[k], next);
+  } else {
+    setSel(rows[i], next);
+  }
+  lastIndex = i;
+  updateCount();
+}
+
+function setSel(row, on) {
+  row.querySelector('input').checked = on;
+  row.classList.toggle('sel', on);
+}
+
+function setAll(on) {
+  epRows().forEach(r => setSel(r, on));
+  updateCount();
+}
+
+function updateCount() {
+  const rows = epRows();
+  const n = rows.filter(r => r.querySelector('input').checked).length;
+  $('mCount').textContent = `${n} van ${rows.length} geselecteerd`;
+  $('mGo').disabled = n === 0;
+  $('mGo').textContent = n > 0 ? `Download ${n} aflevering${n === 1 ? '' : 'en'}` : 'Download';
+}
+
+function closeModal() { $('backdrop').classList.remove('show'); }
+
+function confirmSeries() {
+  const keep = $('mKeep').checked;
+  epRows()
+    .filter(r => r.querySelector('input').checked)
+    .forEach(r => enqueue(r.dataset.url, r.dataset.title, keep));
+  closeModal();
+}
+
+// ---- wiring ---------------------------------------------------------------
+
+$('go').addEventListener('click', onDownload);
+$('url').addEventListener('keydown', e => { if (e.key === 'Enter') onDownload(); });
+$('mAll').addEventListener('click', () => setAll(true));
+$('mNone').addEventListener('click', () => setAll(false));
+$('mGo').addEventListener('click', confirmSeries);
+$('mCancel').addEventListener('click', closeModal);
+$('mClose').addEventListener('click', closeModal);
+$('backdrop').addEventListener('click', e => { if (e.target === $('backdrop')) closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeModal(); });
 
 // Drag & drop a link onto the field
 const drop = $('drop');
@@ -187,7 +360,7 @@ const drop = $('drop');
 drop.addEventListener('drop', e => {
   const t = e.dataTransfer;
   const text = t.getData('text/uri-list') || t.getData('text/plain') || '';
-  if (text) { $('url').value = text.trim().split('\n')[0]; startDownload(); }
+  if (text) { $('url').value = text.trim().split('\n')[0]; onDownload(); }
 });
 </script>
 </body>

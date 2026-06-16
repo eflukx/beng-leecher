@@ -3,7 +3,8 @@
 A small video downloader for **De Schatkamer** (Beeld & Geluid) with a simple
 web interface. Paste or drag an episode URL, and the tool resolves the HLS
 stream, downloads the separate video and audio renditions, and muxes them into a
-single MP4 file you can save.
+single MP4 file you can save. Paste a **series** URL instead and it pops up a
+multi-select of the playable episodes so you can grab a whole season at once.
 
 > ⚠️ **Non-DRM content only.** This tool resolves and remuxes openly delivered
 > HLS streams. It does not break, bypass, or circumvent any DRM or access
@@ -48,15 +49,19 @@ cargo run -- -m /srv/media -t 6h            # media library + 6h cache
 Then open <http://localhost:3380> in your browser (or
 `http://<this-machine-ip>:3380` from another device on your network).
 
-1. Copy an episode link from De Schatkamer, e.g.
-   `https://schatkamer.beeldengeluid.nl/serie/…/aflevering/…`
+1. Copy an **episode** link (`…/aflevering/…`) or a **series** link
+   (`…/serie/…`) from De Schatkamer.
 2. **Paste it** into the field (or **drag the link** onto the box).
 3. Optionally tick **Permanent bewaren op de mediaserver** to keep the file in
    the server's media library instead of as a throwaway download (see
    [Storage & retention](#storage--retention)).
-4. Press **Download**. A progress bar tracks the muxing in real time, and the
-   server console logs each step.
-5. When it finishes, click the save button to download the MP4 to your browser.
+4. Press **Download**.
+   - For an episode, a progress row appears immediately.
+   - For a series, a popup lists the playable episodes — pick which ones to
+     download (see [Downloading a whole series](#downloading-a-whole-series)).
+5. Each download gets its own progress row; the server console logs every step.
+   When a row finishes, click its save button to download the MP4 to your
+   browser.
 
 The server console prints timestamped log lines for every job (page fetch, CDN
 handshake, ffprobe duration, ffmpeg progress per 10%, and the final result or
@@ -78,6 +83,25 @@ By default the server binds to `0.0.0.0:3380`, i.e. **all network interfaces**,
 so it's reachable from other machines on your network — not just loopback. Use
 `-a 127.0.0.1:3380` for local-only access. Note the server has **no
 authentication**, so only expose it on networks you trust.
+
+## Downloading a whole series
+
+Paste a series URL — e.g.
+`https://schatkamer.beeldengeluid.nl/serie/<id>/<slug>` — and the tool fetches
+the series page and shows a **multi-select popup** of its episodes:
+
+- The server always appends `?alleenafspeelbaar=ja` when fetching the series, so
+  only **playable** (downloadable, non-DRM) episodes are listed.
+- Click episodes to toggle them; **Shift-click** selects a contiguous range.
+  **Alles selecteren** / **Niets** toggle everything, and a live counter shows
+  how many of N are selected.
+- The **Permanent bewaren op de mediaserver** toggle in the popup applies to all
+  selected episodes.
+- Confirming starts one independent download per selected episode; each gets its
+  own progress row and runs concurrently.
+
+A URL containing `/serie/` (and not `/aflevering/`) is treated as a series; an
+`/aflevering/` URL is downloaded directly as a single episode.
 
 ## Storage & retention
 
@@ -126,6 +150,12 @@ The pipeline for one download:
    against the total duration (obtained up front via `ffprobe`) to drive the
    progress bar. The browser polls `/api/status/<id>` until the job is done.
 
+For a **series** URL the server fetches the series page (forcing
+`alleenafspeelbaar=ja`) and extracts each episode's id + title from the
+backslash-escaped JSON embedded in the page, builds the `…/aflevering/<id>` URLs,
+and returns them to the UI for selection. Each chosen episode then runs through
+the exact pipeline above as its own job.
+
 ```
 episode page ──► signed master .m3u8 URL
                        │
@@ -147,6 +177,7 @@ The web UI is a thin client over a small JSON API:
 | ------ | ------------------- | -------------------------------------------------- |
 | `GET`  | `/`                 | The single-page web UI.                            |
 | `GET`  | `/api/config`       | Retention settings: `media_dir`, `cache_ttl_secs` (UI labelling). |
+| `POST` | `/api/series`       | Body `{"url": "<series url>"}` → `{"series_title", "episodes":[{"url","title"}]}`. Lists playable episodes. |
 | `POST` | `/api/download`     | Body `{"url": "<episode url>", "keep": <bool>}` → `{"id": "..."}`. Starts a job. `keep` defaults to `false`. |
 | `GET`  | `/api/status/<id>`  | Job status: `status`, `progress`, `message`, `title`, `done`, `error`, `kept`. |
 | `GET`  | `/api/file/<id>`    | Streams the finished MP4 as a download.            |

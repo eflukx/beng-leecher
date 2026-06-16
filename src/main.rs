@@ -93,6 +93,23 @@ struct StartResp {
     id: String,
 }
 
+#[derive(Deserialize)]
+struct SeriesReq {
+    url: String,
+}
+
+#[derive(Serialize)]
+struct Episode {
+    url: String,
+    title: String,
+}
+
+#[derive(Serialize)]
+struct SeriesResp {
+    series_title: String,
+    episodes: Vec<Episode>,
+}
+
 #[tokio::main]
 async fn main() {
     let cfg = parse_args();
@@ -137,6 +154,7 @@ async fn main() {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/config", get(config))
+        .route("/api/series", post(series))
         .route("/api/download", post(start))
         .route("/api/status/:id", get(status))
         .route("/api/file/:id", get(file))
@@ -278,6 +296,14 @@ async fn config(State(st): State<AppState>) -> Json<serde_json::Value> {
         "media_dir": st.cfg.media_dir,
         "cache_ttl_secs": st.cfg.cache_ttl_secs,
     }))
+}
+
+/// List the downloadable episodes of a series so the UI can offer a multi-select.
+async fn series(State(st): State<AppState>, Json(req): Json<SeriesReq>) -> Response {
+    match resolve_series(&st.client, &req.url).await {
+        Ok(r) => Json(r).into_response(),
+        Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
+    }
 }
 
 async fn start(State(st): State<AppState>, Json(req): Json<DownloadReq>) -> Json<StartResp> {
@@ -548,6 +574,77 @@ async fn resolve(
         .unwrap_or_else(|| "schatkamer-video".into());
 
     Ok((master_plain, cookie, title))
+}
+
+/// Fetch a series page (forcing `alleenafspeelbaar=ja` so only playable episodes
+/// are listed) and extract its episodes as (url, title) pairs in page order.
+async fn resolve_series(client: &reqwest::Client, page_url: &str) -> Result<SeriesResp, String> {
+    if !page_url.starts_with("http") || !page_url.contains("/serie/") {
+        return Err("Geef een geldige serie-URL op.".into());
+    }
+
+    // Drop any existing query and force the "only playable" filter.
+    let base = page_url.split('?').next().unwrap_or(page_url).trim_end_matches('/');
+    let fetch_url = format!("{base}?alleenafspeelbaar=ja");
+    log(format!("serie ophalen: {fetch_url}"));
+
+    let html = client
+        .get(&fetch_url)
+        .send()
+        .await
+        .map_err(|e| format!("Serie-pagina ophalen mislukt: {e}"))?
+        .text()
+        .await
+        .map_err(|e| format!("Serie-pagina lezen mislukt: {e}"))?;
+
+    // Episode objects are embedded as backslash-escaped JSON:
+    //   \"id\":\"<id>\",\"title\":\"<title>\",\"seriesTitle\":\"<series>\"
+    let re = Regex::new(
+        r#"\\"id\\":\\"(\d+)\\",\\"title\\":\\"([^\\"]+)\\",\\"seriesTitle\\":\\"([^\\"]+)\\""#,
+    )
+    .unwrap();
+
+    let mut seen = std::collections::HashSet::new();
+    let mut episodes = Vec::new();
+    let mut series_title = String::new();
+    for c in re.captures_iter(&html) {
+        let id = c[1].to_string();
+        if seen.insert(id.clone()) {
+            if series_title.is_empty() {
+                series_title = html_unescape(&c[3]);
+            }
+            episodes.push(Episode {
+                url: format!("{base}/aflevering/{id}"),
+                title: html_unescape(&c[2]),
+            });
+        }
+    }
+
+    if episodes.is_empty() {
+        return Err("Geen afspeelbare afleveringen gevonden op deze serie-pagina.".into());
+    }
+    if series_title.is_empty() {
+        series_title = "Serie".into();
+    }
+
+    log(format!(
+        "serie '{series_title}': {} afspeelbare afleveringen gevonden",
+        episodes.len()
+    ));
+    Ok(SeriesResp {
+        series_title,
+        episodes,
+    })
+}
+
+/// Decode the handful of HTML entities that show up in episode titles.
+fn html_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&#x27;", "'")
+        .replace("&#39;", "'")
+        .replace("&quot;", "\"")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
 }
 
 async fn probe_duration(master: &str, cookie: &str) -> Option<f64> {
