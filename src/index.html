@@ -1,0 +1,194 @@
+<!DOCTYPE html>
+<html lang="nl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Schatkamer downloader</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(circle at 30% 20%, #1d2b4a, #0b1020 70%); color: #e7ecf5;
+  }
+  .card {
+    width: min(560px, 92vw); background: #141b30; border: 1px solid #283556;
+    border-radius: 16px; padding: 28px 30px 32px; box-shadow: 0 20px 60px rgba(0,0,0,.45);
+  }
+  h1 { margin: 0 0 4px; font-size: 1.35rem; }
+  p.sub { margin: 0 0 22px; color: #8a97b8; font-size: .9rem; }
+  label { display: block; font-size: .8rem; color: #8a97b8; margin-bottom: 6px; }
+  .row { display: flex; gap: 10px; }
+  input[type=url] {
+    flex: 1; padding: 12px 14px; border-radius: 10px; border: 1px solid #2f3d63;
+    background: #0e1426; color: #e7ecf5; font-size: .95rem;
+  }
+  input[type=url]:focus { outline: none; border-color: #5b8cff; }
+  button {
+    padding: 12px 18px; border: 0; border-radius: 10px; cursor: pointer; font-weight: 600;
+    background: #4c7bff; color: #fff; font-size: .95rem;
+  }
+  button:disabled { opacity: .5; cursor: default; }
+  .panel { margin-top: 22px; display: none; }
+  .panel.show { display: block; }
+  .status { font-size: .9rem; margin-bottom: 8px; }
+  .bar { height: 10px; background: #0e1426; border-radius: 999px; overflow: hidden; border: 1px solid #2f3d63; }
+  .fill { height: 100%; width: 0; background: linear-gradient(90deg, #4c7bff, #6ad1ff); transition: width .3s; }
+  .msg { font-size: .8rem; color: #8a97b8; margin-top: 8px; min-height: 1em; }
+  .done { display: inline-block; margin-top: 16px; padding: 11px 18px; border-radius: 10px;
+          background: #1f9d55; color: #fff; text-decoration: none; font-weight: 600; }
+  .err { color: #ff8080; }
+  .drop { border: 1px dashed #2f3d63; border-radius: 10px; }
+  .drop.over { border-color: #5b8cff; background: #0e1426; }
+  footer { margin-top: 24px; font-size: .72rem; color: #5f6c8f; line-height: 1.5; }
+  .keep { display: flex; align-items: center; gap: 8px; margin-top: 14px;
+          font-size: .82rem; color: #b6c0da; cursor: pointer; }
+  .keep input { width: 16px; height: 16px; accent-color: #4c7bff; cursor: pointer; }
+  .warn { margin-top: 10px; font-size: .8rem; color: #ffc85c; min-height: 1em; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Schatkamer downloader</h1>
+    <p class="sub">Plak of sleep een afleverings-URL van De Schatkamer hierheen.</p>
+
+    <label for="url">Afleverings-URL</label>
+    <div class="row drop" id="drop">
+      <input id="url" type="url" placeholder="https://schatkamer.beeldengeluid.nl/serie/…/aflevering/…" autocomplete="off">
+      <button id="go">Download</button>
+    </div>
+
+    <label class="keep" id="keepLabel">
+      <input type="checkbox" id="keep">
+      <span id="keepText">Permanent bewaren op de mediaserver</span>
+    </label>
+
+    <div class="panel" id="panel">
+      <div class="status" id="status">…</div>
+      <div class="bar"><div class="fill" id="fill"></div></div>
+      <div class="msg" id="msg"></div>
+      <div class="warn" id="warn"></div>
+      <a class="done" id="dl" style="display:none">⬇ Bewaar bestand</a>
+    </div>
+
+    <footer>
+      Alleen voor niet-DRM content. Video en audio worden via ffmpeg samengevoegd tot één MP4-bestand.
+    </footer>
+  </div>
+
+<script>
+const $ = id => document.getElementById(id);
+let timer = null;
+const MAX_FAILS = 10;          // ~6s of failed polls before giving up
+let fails = 0;
+
+// Fetch retention config to label the "keep on server" option.
+fetch('/api/config').then(r => r.json()).then(cfg => {
+  const ttlMin = Math.round((cfg.cache_ttl_secs || 0) / 60);
+  const note = cfg.cache_ttl_secs > 0
+    ? `tijdelijke downloads worden na ${ttlMin} min van de server verwijderd`
+    : `tijdelijke downloads blijven op de server staan`;
+  $('keepText').textContent =
+    `Permanent bewaren op de mediaserver (anders: ${note})`;
+}).catch(() => {});
+
+async function startDownload() {
+  const url = $('url').value.trim();
+  if (!url) return;
+  const keep = $('keep').checked;
+
+  $('go').disabled = true;
+  $('panel').classList.add('show');
+  $('dl').style.display = 'none';
+  $('status').classList.remove('err');
+  $('warn').textContent = '';
+  $('fill').style.width = '0%';
+  $('status').textContent = 'Starten…';
+  $('msg').textContent = '';
+  fails = 0;
+
+  let id;
+  try {
+    const r = await fetch('/api/download', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ url, keep })
+    });
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    id = (await r.json()).id;
+  } catch (e) {
+    fail('Kon download niet starten — backend onbereikbaar.');
+    return;
+  }
+  poll(id, keep);
+}
+
+function poll(id, keep) {
+  clearInterval(timer);
+  timer = setInterval(async () => {
+    let j;
+    try {
+      const r = await fetch('/api/status/' + id);
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      j = await r.json();
+    } catch (e) {
+      // Connection hiccup: warn and keep retrying up to MAX_FAILS.
+      fails++;
+      if (fails >= MAX_FAILS) {
+        clearInterval(timer);
+        fail('Verbinding met de server verbroken. Vernieuw de pagina en probeer opnieuw.');
+        return;
+      }
+      $('warn').textContent = `⚠ Geen verbinding met de server… opnieuw proberen (${fails}/${MAX_FAILS})`;
+      return;
+    }
+
+    // Recovered from any transient failures.
+    fails = 0;
+    $('warn').textContent = '';
+
+    $('status').textContent = j.status + (j.title ? ' — ' + j.title : '');
+    $('fill').style.width = (j.progress || 0) + '%';
+    $('msg').textContent = j.message || '';
+
+    if (j.done) {
+      clearInterval(timer);
+      $('go').disabled = false;
+      if (j.error) {
+        $('status').classList.add('err');
+      } else {
+        $('fill').style.width = '100%';
+        const a = $('dl');
+        a.href = '/api/file/' + id;
+        a.textContent = keep ? '⬇ Ook lokaal opslaan' : '⬇ Bewaar bestand';
+        a.style.display = 'inline-block';
+      }
+    }
+  }, 600);
+}
+
+function fail(text) {
+  $('go').disabled = false;
+  $('status').classList.add('err');
+  $('status').textContent = text;
+  $('warn').textContent = '';
+}
+
+$('go').addEventListener('click', startDownload);
+$('url').addEventListener('keydown', e => { if (e.key === 'Enter') startDownload(); });
+
+// Drag & drop a link onto the field
+const drop = $('drop');
+['dragenter', 'dragover'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave', 'drop'].forEach(ev =>
+  drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => {
+  const t = e.dataTransfer;
+  const text = t.getData('text/uri-list') || t.getData('text/plain') || '';
+  if (text) { $('url').value = text.trim().split('\n')[0]; startDownload(); }
+});
+</script>
+</body>
+</html>
