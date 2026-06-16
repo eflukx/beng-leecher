@@ -144,6 +144,7 @@ async fn main() {
     let client = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .user_agent(UA)
+        .use_preconfigured_tls(tls_config())
         .build()
         .expect("build http client");
 
@@ -169,8 +170,8 @@ async fn main() {
         .route("/api/config", get(config))
         .route("/api/series", post(series))
         .route("/api/download", post(start))
-        .route("/api/status/:id", get(status))
-        .route("/api/file/:id", get(file))
+        .route("/api/status/{id}", get(status))
+        .route("/api/file/{id}", get(file))
         .with_state(state);
 
     let listener = match tokio::net::TcpListener::bind(&cfg.addr).await {
@@ -185,6 +186,21 @@ async fn main() {
         eprintln!("Server gestopt met fout: {e}");
         std::process::exit(1);
     }
+}
+
+/// Build a rustls client config using the ring crypto provider and the
+/// webpki-roots trust anchors compiled into the binary (no OS trust store).
+fn tls_config() -> rustls::ClientConfig {
+    let roots = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("rustls protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth()
 }
 
 /// Parse CLI arguments into a [`Config`].

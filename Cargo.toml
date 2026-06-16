@@ -5,8 +5,14 @@ edition = "2024"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
-axum = "0.7"
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+axum = "0.8"
+# `rustls-no-provider` keeps rustls but lets us supply our own crypto provider
+# (ring) and root store (webpki-roots, baked into the binary). This avoids
+# aws-lc-rs/cmake and the OS trust store, so the static scratch image needs no
+# CA-certificate files.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 regex = "1"
