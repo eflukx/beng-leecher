@@ -77,9 +77,13 @@
         cursor: pointer; user-select: none; }
   .ep:hover { background: #0e1426; }
   .ep.sel { background: #16223f; }
+  .ep.have { opacity: .6; cursor: default; }
+  .ep.have:hover { background: none; }
   .ep input { width: 17px; height: 17px; accent-color: #4c7bff; pointer-events: none; }
   .ep .t { font-size: .9rem; }
   .ep .n { font-size: .72rem; color: #6f7ea3; min-width: 26px; }
+  .ep .badge { margin-left: auto; font-size: .68rem; color: #6ad19a;
+               border: 1px solid #2c5d44; border-radius: 999px; padding: 2px 8px; white-space: nowrap; }
   .modal-foot { padding: 14px 22px; border-top: 1px solid #243152; display: flex;
                 align-items: center; gap: 12px; }
   .modal-foot .keep { margin: 0; margin-right: auto; }
@@ -280,14 +284,27 @@ async function openSeries(url) {
   list.innerHTML = '';
   data.episodes.forEach((ep, i) => {
     const row = document.createElement('label');
-    row.className = 'ep';
+    row.className = 'ep' + (ep.downloaded ? ' have' : '');
     row.innerHTML = `<input type="checkbox"><span class="n">${i + 1}.</span><span class="t"></span>`;
     row.querySelector('.t').textContent = ep.title;
     row.dataset.url = ep.url;
     row.dataset.title = ep.title;
-    row.addEventListener('click', e => toggleEp(e, i));
+    if (ep.downloaded) {
+      row.dataset.have = '1';
+      row.querySelector('input').disabled = true;
+      const b = document.createElement('span');
+      b.className = 'badge';
+      b.textContent = '✓ al gedownload';
+      row.appendChild(b);
+    } else {
+      row.addEventListener('click', e => toggleEp(e, i));
+    }
     list.appendChild(row);
   });
+  const haveCount = data.episodes.filter(e => e.downloaded).length;
+  $('mTitle').textContent = haveCount
+    ? `Kies afleveringen — ${data.series_title} (${haveCount} al gedownload)`
+    : `Kies afleveringen — ${data.series_title}`;
   lastIndex = -1;
   updateCount();
   $('backdrop').classList.add('show');
@@ -312,6 +329,7 @@ function toggleEp(e, i) {
 }
 
 function setSel(row, on) {
+  if (row.dataset.have) return;        // can't select already-downloaded episodes
   row.querySelector('input').checked = on;
   row.classList.toggle('sel', on);
 }
@@ -322,9 +340,9 @@ function setAll(on) {
 }
 
 function updateCount() {
-  const rows = epRows();
-  const n = rows.filter(r => r.querySelector('input').checked).length;
-  $('mCount').textContent = `${n} van ${rows.length} geselecteerd`;
+  const selectable = epRows().filter(r => !r.dataset.have);
+  const n = selectable.filter(r => r.querySelector('input').checked).length;
+  $('mCount').textContent = `${n} van ${selectable.length} geselecteerd`;
   $('mGo').disabled = n === 0;
   $('mGo').textContent = n > 0 ? `Download ${n} aflevering${n === 1 ? '' : 'en'}` : 'Download';
 }

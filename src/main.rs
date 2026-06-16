@@ -6,7 +6,7 @@
 //!   3. Hand the (unsigned) master URL + those cookies to ffmpeg, which follows the
 //!      variant/audio playlists, downloads every segment and muxes video+audio to MP4.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -78,6 +78,10 @@ struct AppState {
     jobs: Arc<Mutex<HashMap<String, Job>>>,
     client: reqwest::Client,
     cfg: Config,
+    /// Persistent map: episode key -> media library filename (for dedup of kept files).
+    media_index: Arc<Mutex<HashMap<String, String>>>,
+    /// Episode keys currently being downloaded, to skip duplicate concurrent jobs.
+    active: Arc<Mutex<HashSet<String>>>,
 }
 
 #[derive(Deserialize)]
@@ -102,6 +106,8 @@ struct SeriesReq {
 struct Episode {
     url: String,
     title: String,
+    /// True when this episode is already present in cache or media library.
+    downloaded: bool,
 }
 
 #[derive(Serialize)]
@@ -141,10 +147,17 @@ async fn main() {
         .build()
         .expect("build http client");
 
+    let media_index = load_media_index(&cfg.media_dir);
+    log(format!(
+        "mediabibliotheek-index: {} eerder bewaarde aflevering(en)",
+        media_index.len()
+    ));
     let state = AppState {
         jobs: Arc::new(Mutex::new(HashMap::new())),
         client,
         cfg: cfg.clone(),
+        media_index: Arc::new(Mutex::new(media_index)),
+        active: Arc::new(Mutex::new(HashSet::new())),
     };
 
     if cfg.cache_ttl_secs > 0 {
@@ -300,7 +313,7 @@ async fn config(State(st): State<AppState>) -> Json<serde_json::Value> {
 
 /// List the downloadable episodes of a series so the UI can offer a multi-select.
 async fn series(State(st): State<AppState>, Json(req): Json<SeriesReq>) -> Response {
-    match resolve_series(&st.client, &req.url).await {
+    match resolve_series(&st, &req.url).await {
         Ok(r) => Json(r).into_response(),
         Err(e) => (StatusCode::BAD_REQUEST, e).into_response(),
     }
@@ -360,22 +373,75 @@ async fn file(State(st): State<AppState>, Path(id): Path<String>) -> Response {
 // ---- job pipeline ---------------------------------------------------------
 
 async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
-    set(&st, &id, |j| {
+    let key = episode_key(&page_url);
+    let cache = cache_path(&key);
+
+    // ---- skip if we already have this episode ----------------------------
+    // Already in the permanent media library? Serve that, regardless of mode.
+    let media_path = st
+        .media_index
+        .lock()
+        .unwrap()
+        .get(&key)
+        .map(|f| format!("{}/{f}", st.cfg.media_dir));
+    if let Some(mp) = media_path {
+        if file_nonempty(&mp).await {
+            log(format!("[{id}] overslaan: al in mediabibliotheek ({mp})"));
+            return finish_ok(&st, &id, &mp, true, "Al aanwezig in mediabibliotheek — niet opnieuw gedownload");
+        }
+    }
+    // Already in the cache?
+    if file_nonempty(&cache).await {
+        if keep {
+            // Wanted permanently but only cached: promote without re-downloading.
+            log(format!("[{id}] al in cache; verplaatsen naar mediabibliotheek (geen nieuwe download)"));
+            let title = fetch_title(&st.client, &page_url).await;
+            let dest = unique_media_path(&st.cfg.media_dir, &format!("{}.mp4", sanitize(&title)));
+            match tokio::fs::rename(&cache, &dest).await {
+                Ok(()) => {
+                    remember_media(&st, &key, &dest);
+                    return finish_ok(&st, &id, &dest, true, "Was al in cache — verplaatst naar mediabibliotheek");
+                }
+                Err(e) => log(format!("[{id}] WAARSCHUWING: promoveren mislukt ({e}); cache wordt geserveerd")),
+            }
+        }
+        log(format!("[{id}] overslaan: al in cache ({cache})"));
+        return finish_ok(&st, &id, &cache, false, "Al aanwezig in cache — niet opnieuw gedownload");
+    }
+
+    // ---- guard against a concurrent duplicate of the same episode --------
+    if !st.active.lock().unwrap().insert(key.clone()) {
+        log(format!("[{id}] overslaan: wordt al gedownload (key {key})"));
+        set(&st, &id, |j| {
+            j.done = true;
+            j.status = "Overgeslagen".into();
+            j.message = "Deze aflevering wordt al door een andere taak gedownload.".into();
+        });
+        return;
+    }
+
+    run_pipeline(&st, &id, &page_url, &key, &cache, keep).await;
+    st.active.lock().unwrap().remove(&key);
+}
+
+/// Resolve, download and mux a single episode to `out`, updating the job state.
+async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &str, keep: bool) {
+    set(st, id, |j| {
         j.status = "Video-URL opzoeken…".into();
     });
     log(format!("[{id}] stap 1/3: episodepagina ophalen en stream opzoeken"));
 
-    let (master, cookie, title) = match resolve(&st.client, &id, &page_url).await {
+    let (master, cookie, title) = match resolve(&st.client, id, page_url).await {
         Ok(v) => v,
         Err(e) => {
             log(format!("[{id}] FOUT tijdens opzoeken: {e}"));
-            return fail(&st, &id, e);
+            return fail(st, id, e);
         }
     };
     log(format!("[{id}] titel: {title}"));
 
     let filename = format!("{}.mp4", sanitize(&title));
-    set(&st, &id, |j| {
+    set(st, id, |j| {
         j.title = title.clone();
         j.filename = filename.clone();
         j.status = "Downloaden…".into();
@@ -383,7 +449,6 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
 
     let duration = probe_duration(&master, &cookie).await.unwrap_or(0.0);
     log(format!("[{id}] duur volgens ffprobe: {duration:.0} sec"));
-    let out = format!("{DOWNLOAD_DIR}/{id}.mp4");
     log(format!("[{id}] stap 3/3: ffmpeg start, muxt naar {out}"));
 
     let mut child = match Command::new("ffmpeg")
@@ -403,7 +468,7 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
             "-progress",
             "pipe:1",
             "-nostats",
-            &out,
+            out,
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -412,7 +477,7 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
         Ok(c) => c,
         Err(e) => {
             log(format!("[{id}] FOUT: ffmpeg kon niet starten: {e}"));
-            return fail(&st, &id, format!("ffmpeg kon niet starten: {e}"));
+            return fail(st, id, format!("ffmpeg kon niet starten: {e}"));
         }
     };
 
@@ -435,7 +500,7 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
                 } else {
                     0.0
                 };
-                set(&st, &id, |j| {
+                set(st, id, |j| {
                     if duration > 0.0 {
                         j.progress = pct;
                         j.message = format!("{} / {} sec", secs as u64, duration as u64);
@@ -459,37 +524,41 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
 
     let success = matches!(child.wait().await, Ok(s) if s.success());
     if success {
-        let size = tokio::fs::metadata(&out).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(out).await.map(|m| m.len()).unwrap_or(0);
         let size_mb = size as f64 / 1_048_576.0;
 
         // For a "keep on server" job, move the finished file out of the cache dir
         // into the permanent media library so the TTL cleanup never touches it.
-        let (final_path, msg) = if keep {
+        let (final_path, kept, msg) = if keep {
             let dest = unique_media_path(&st.cfg.media_dir, &filename);
-            match tokio::fs::rename(&out, &dest).await {
+            match tokio::fs::rename(out, &dest).await {
                 Ok(()) => {
+                    remember_media(st, key, &dest);
                     log(format!("[{id}] KLAAR: opgeslagen op mediaserver: {dest} ({size_mb:.1} MB)"));
-                    (dest.clone(), format!("Opgeslagen op de mediaserver: {dest}"))
+                    (dest.clone(), true, format!("Opgeslagen op de mediaserver: {dest}"))
                 }
                 Err(e) => {
                     // Fall back to serving from the cache dir if the move failed.
                     log(format!("[{id}] WAARSCHUWING: verplaatsen naar mediaserver mislukt ({e}); blijft in cache"));
-                    (out.clone(), format!("Opgeslagen in cache (verplaatsen mislukte): {out}"))
+                    (out.to_string(), false, format!("Opgeslagen in cache (verplaatsen mislukte): {out}"))
                 }
             }
         } else {
             log(format!("[{id}] KLAAR: {out} ({size_mb:.1} MB)"));
-            (out.clone(), "Download voltooid".to_string())
+            (out.to_string(), false, "Download voltooid".to_string())
         };
 
-        set(&st, &id, |j| {
+        set(st, id, |j| {
             j.progress = 100.0;
             j.done = true;
+            j.kept = kept;
             j.status = "Klaar".into();
             j.message = msg;
             j.path = final_path;
         });
     } else {
+        // Drop any partial output so it isn't mistaken for a complete cache hit.
+        tokio::fs::remove_file(out).await.ok();
         let mut err = String::new();
         if let Some(mut se) = child.stderr.take() {
             se.read_to_string(&mut err).await.ok();
@@ -500,7 +569,7 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
             if trimmed.is_empty() { "(leeg)" } else { trimmed }
         ));
         let last = trimmed.lines().last().unwrap_or("onbekende fout").to_string();
-        fail(&st, &id, format!("ffmpeg fout: {last}"));
+        fail(st, id, format!("ffmpeg fout: {last}"));
     }
 }
 
@@ -578,7 +647,7 @@ async fn resolve(
 
 /// Fetch a series page (forcing `alleenafspeelbaar=ja` so only playable episodes
 /// are listed) and extract its episodes as (url, title) pairs in page order.
-async fn resolve_series(client: &reqwest::Client, page_url: &str) -> Result<SeriesResp, String> {
+async fn resolve_series(st: &AppState, page_url: &str) -> Result<SeriesResp, String> {
     if !page_url.starts_with("http") || !page_url.contains("/serie/") {
         return Err("Geef een geldige serie-URL op.".into());
     }
@@ -588,7 +657,8 @@ async fn resolve_series(client: &reqwest::Client, page_url: &str) -> Result<Seri
     let fetch_url = format!("{base}?alleenafspeelbaar=ja");
     log(format!("serie ophalen: {fetch_url}"));
 
-    let html = client
+    let html = st
+        .client
         .get(&fetch_url)
         .send()
         .await
@@ -604,7 +674,7 @@ async fn resolve_series(client: &reqwest::Client, page_url: &str) -> Result<Seri
     )
     .unwrap();
 
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     let mut episodes = Vec::new();
     let mut series_title = String::new();
     for c in re.captures_iter(&html) {
@@ -613,9 +683,11 @@ async fn resolve_series(client: &reqwest::Client, page_url: &str) -> Result<Seri
             if series_title.is_empty() {
                 series_title = html_unescape(&c[3]);
             }
+            // The episode id is also its dedup key.
             episodes.push(Episode {
                 url: format!("{base}/aflevering/{id}"),
                 title: html_unescape(&c[2]),
+                downloaded: is_downloaded(st, &id),
             });
         }
     }
@@ -680,6 +752,119 @@ fn fail(st: &AppState, id: &str, msg: impl Into<String>) {
         j.status = "Fout".into();
         j.message = msg.into();
     });
+}
+
+/// Mark a job as completed without (re)downloading, pointing at an existing file.
+fn finish_ok(st: &AppState, id: &str, path: &str, kept: bool, msg: impl Into<String>) {
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "video.mp4".into());
+    set(st, id, |j| {
+        j.progress = 100.0;
+        j.done = true;
+        j.error = false;
+        j.kept = kept;
+        j.status = "Klaar".into();
+        j.message = msg.into();
+        j.path = path.to_string();
+        if j.filename.is_empty() {
+            j.filename = filename;
+        }
+    });
+}
+
+/// Stable per-episode identity: the numeric id after `/aflevering/`, else a
+/// sanitized form of the whole URL.
+fn episode_key(url: &str) -> String {
+    if let Some(pos) = url.find("/aflevering/") {
+        let id: String = url[pos + "/aflevering/".len()..]
+            .chars()
+            .take_while(|c| c.is_ascii_digit())
+            .collect();
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    url.chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string()
+}
+
+fn cache_path(key: &str) -> String {
+    format!("{DOWNLOAD_DIR}/{key}.mp4")
+}
+
+async fn file_nonempty(path: &str) -> bool {
+    tokio::fs::metadata(path)
+        .await
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+/// Is this episode already present in the cache or the media library?
+fn is_downloaded(st: &AppState, key: &str) -> bool {
+    let cached = std::fs::metadata(cache_path(key))
+        .map(|m| m.len() > 0)
+        .unwrap_or(false);
+    if cached {
+        return true;
+    }
+    if let Some(f) = st.media_index.lock().unwrap().get(key) {
+        return std::path::Path::new(&format!("{}/{f}", st.cfg.media_dir)).exists();
+    }
+    false
+}
+
+/// Record a kept file in the media index and persist it.
+fn remember_media(st: &AppState, key: &str, dest_path: &str) {
+    let filename = std::path::Path::new(dest_path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let snapshot = {
+        let mut idx = st.media_index.lock().unwrap();
+        idx.insert(key.to_string(), filename);
+        idx.clone()
+    };
+    save_media_index(&st.cfg.media_dir, &snapshot);
+}
+
+fn media_index_path(dir: &str) -> String {
+    format!("{dir}/.beng_leecher_index.json")
+}
+
+/// Load the media index, pruning entries whose file has since been deleted.
+fn load_media_index(dir: &str) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = std::fs::read_to_string(media_index_path(dir))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default();
+    map.retain(|_, f| std::path::Path::new(&format!("{dir}/{f}")).exists());
+    map
+}
+
+fn save_media_index(dir: &str, map: &HashMap<String, String>) {
+    if let Ok(s) = serde_json::to_string_pretty(map) {
+        std::fs::write(media_index_path(dir), s).ok();
+    }
+}
+
+/// Lightweight fetch of just the episode page `<title>` (used when promoting a
+/// cached file to the media library without re-downloading).
+async fn fetch_title(client: &reqwest::Client, url: &str) -> String {
+    let html = match client.get(url).send().await {
+        Ok(r) => r.text().await.unwrap_or_default(),
+        Err(_) => String::new(),
+    };
+    Regex::new(r"<title>([^<]*)</title>")
+        .unwrap()
+        .captures(&html)
+        .map(|c| c[1].trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| "schatkamer-video".into())
 }
 
 fn new_id() -> String {

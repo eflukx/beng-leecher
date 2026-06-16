@@ -100,6 +100,10 @@ the series page and shows a **multi-select popup** of its episodes:
 - Confirming starts one independent download per selected episode; each gets its
   own progress row and runs concurrently.
 
+Episodes that are **already downloaded** are shown greyed out with a
+*✓ al gedownload* badge and can't be re-selected (see
+[Skipping already-downloaded episodes](#skipping-already-downloaded-episodes)).
+
 A URL containing `/serie/` (and not `/aflevering/`) is treated as a series; an
 `/aflevering/` URL is downloaded directly as a single episode.
 
@@ -108,10 +112,11 @@ A URL containing `/serie/` (and not `/aflevering/`) is treated as a series; an
 There are two places a finished file can live:
 
 - **Cache (`./downloads/`)** — the default. Used for browser-bound downloads.
-  Files here are named `<job-id>.mp4` and are **automatically purged** once they
-  are older than `--cache-ttl` (default 60 minutes). A background task sweeps the
-  directory periodically (every TTL/10, clamped to 1–60 min). Set `--cache-ttl 0`
-  to keep cached files indefinitely (no purging).
+  Files are named by their **episode id** (e.g. `2101608060045577131.mp4`) so
+  they can be recognised later, and are **automatically purged** once older than
+  `--cache-ttl` (default 60 minutes). A background task sweeps the directory
+  periodically (every TTL/10, clamped to 1–60 min). Set `--cache-ttl 0` to keep
+  cached files indefinitely (no purging).
 - **Media library (`--media-dir`, default `./media/`)** — used when the
   **Permanent bewaren op de mediaserver** checkbox is ticked. The finished file
   is moved here under its episode title (e.g.
@@ -119,10 +124,30 @@ There are two places a finished file can live:
   suffix on name collisions, and is **never** touched by the cache cleanup. This
   is the "download to the media server instead of the web client" mode — you can
   fire off a download and leave it on the server; downloading it to your browser
-  afterwards is optional.
+  afterwards is optional. A small `media/.beng_leecher_index.json` maps episode
+  ids to their saved filenames so kept files are recognised across restarts.
 
 Jobs are tracked in memory; a kept file persists on disk regardless, while a
 cached file disappears from the job list when it is purged.
+
+## Skipping already-downloaded episodes
+
+Each episode has a stable key — the numeric id from its `…/aflevering/<id>` URL.
+Before downloading, the tool checks whether that episode already exists and, if
+so, **does not download it again**:
+
+- **Already in the media library** → the job completes immediately, pointing at
+  the existing file (works in both modes).
+- **Already in the cache** (and you didn't ask to keep it) → likewise skipped.
+- **Already in the cache but you ticked "keep"** → the cached file is **moved**
+  into the media library instead of being downloaded again.
+
+The status row shows *"Al aanwezig in cache/mediabibliotheek — niet opnieuw
+gedownload"* in these cases. A concurrent in-progress guard also prevents two
+jobs from downloading the same episode at once. For a series, this same check
+drives the *✓ al gedownload* badges in the selection popup, so you don't even
+pick episodes you already have. (If a cached file was purged by the TTL, the
+episode is simply downloaded again.)
 
 ---
 
@@ -177,7 +202,7 @@ The web UI is a thin client over a small JSON API:
 | ------ | ------------------- | -------------------------------------------------- |
 | `GET`  | `/`                 | The single-page web UI.                            |
 | `GET`  | `/api/config`       | Retention settings: `media_dir`, `cache_ttl_secs` (UI labelling). |
-| `POST` | `/api/series`       | Body `{"url": "<series url>"}` → `{"series_title", "episodes":[{"url","title"}]}`. Lists playable episodes. |
+| `POST` | `/api/series`       | Body `{"url": "<series url>"}` → `{"series_title", "episodes":[{"url","title","downloaded"}]}`. Lists playable episodes; `downloaded` flags those already in cache/media. |
 | `POST` | `/api/download`     | Body `{"url": "<episode url>", "keep": <bool>}` → `{"id": "..."}`. Starts a job. `keep` defaults to `false`. |
 | `GET`  | `/api/status/<id>`  | Job status: `status`, `progress`, `message`, `title`, `done`, `error`, `kept`. |
 | `GET`  | `/api/file/<id>`    | Streams the finished MP4 as a download.            |
