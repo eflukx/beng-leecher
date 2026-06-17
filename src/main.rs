@@ -763,36 +763,46 @@ async fn resolve(
     })
 }
 
-/// Pull the episode's broadcast date (YYYY-MM-DD) from `publishedAtISO`.
+/// Pull the episode's broadcast date (YYYY-MM-DD) from `publishedAtISO` in the
+/// decoded RSC payload, reading the value as JSON with serde.
 fn extract_date(html: &str) -> Option<String> {
-    Regex::new(r#"\\"publishedAtISO\\":\\"(\d{4}-\d{2}-\d{2})"#)
-        .unwrap()
-        .captures(html)
-        .map(|c| c[1].to_string())
+    let flight = flight_payload(html);
+    let key = "\"publishedAtISO\":";
+    let p = flight.find(key)?;
+    let iso: String = serde_json::Deserializer::from_str(&flight[p + key.len()..])
+        .into_iter::<String>()
+        .next()?
+        .ok()?;
+    // ISO timestamp like "1991-12-15T00:00:00.000Z" → take the date part.
+    let date = iso.get(..10)?;
+    let b = date.as_bytes();
+    (date.len() == 10 && b[4] == b'-' && b[7] == b'-').then(|| date.to_string())
 }
 
-/// Pull *this episode's* description from the page JSON and unescape it to a
-/// single tidy line for a metadata tag. Anchored to the episode id so it can't
-/// grab the site-wide meta description.
+/// Pull *this episode's* description from the decoded RSC payload. Anchored to
+/// the episode's object (by id) so it can't grab the site-wide meta description,
+/// and parsed with serde so all JSON escaping is handled correctly.
 fn extract_description(html: &str, episode_key: &str) -> Option<String> {
-    // `[^{}]` keeps the match inside the one flat JSON object that holds the id.
-    let pat = r#"\\"id\\":\\"__ID__\\"[^{}]*?\\"description\\":\\"(.*?)\\""#
-        .replace("__ID__", &regex::escape(episode_key));
-    let raw = Regex::new(&pat).ok()?.captures(html).map(|c| c[1].to_string())?;
-    let cleaned = raw
-        .replace("\\\\", "\\") // page double-escapes: collapse `\\` to `\` first
-        .replace("\\n", " ")
-        .replace("\\r", " ")
-        .replace("\\t", " ")
-        .replace("\\u0026", "&")
-        .replace("\\\"", "\"");
-    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
-    let cleaned = html_unescape(&cleaned);
-    if cleaned.is_empty() {
-        None
-    } else {
-        Some(cleaned)
+    #[derive(serde::Deserialize)]
+    struct EpObj {
+        id: Option<String>,
+        description: Option<String>,
     }
+    let flight = flight_payload(html);
+    // Find this episode's object and deserialize from its opening brace; serde
+    // stops at the matching close brace and undoes all escaping for us.
+    let p = flight.find(&format!("\"id\":\"{episode_key}\""))?;
+    let brace = flight[..=p].rfind('{')?;
+    let ep: EpObj = serde_json::Deserializer::from_str(&flight[brace..])
+        .into_iter::<EpObj>()
+        .next()?
+        .ok()?;
+    if ep.id.as_deref() != Some(episode_key) {
+        return None;
+    }
+    let desc = html_unescape(&ep.description?);
+    let desc = desc.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!desc.is_empty()).then_some(desc)
 }
 
 /// Fetch a series page (forcing `alleenafspeelbaar=ja` so only playable episodes
