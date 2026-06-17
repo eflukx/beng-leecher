@@ -338,7 +338,9 @@ async fn cleanup_loop(st: AppState) {
         };
         while let Ok(Some(entry)) = dir.next_entry().await {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("mp4") {
+            // Sweep finished cache files (.mp4) and abandoned partials (.part).
+            let ext = path.extension().and_then(|e| e.to_str());
+            if ext != Some("mp4") && ext != Some("part") {
                 continue;
             }
             let Ok(meta) = entry.metadata().await else { continue };
@@ -544,7 +546,12 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
 
     let duration = probe_duration(&master, &cookie).await.unwrap_or(0.0);
     log(format!("[{id}] duur volgens ffprobe: {duration:.0} sec"));
-    log(format!("[{id}] stap 3/3: ffmpeg start, muxt naar {out}"));
+
+    // Mux to a temporary `.part` file and only publish it to the canonical name
+    // on success. A partial left by a crash/failure therefore never looks like a
+    // finished cache hit (which would block retries) and is overwritten next time.
+    let tmp = format!("{out}.part");
+    log(format!("[{id}] stap 3/3: ffmpeg start, muxt naar {tmp}"));
 
     let mut cmd = Command::new("ffmpeg");
     cmd.args(["-y", "-loglevel", "error", "-headers"])
@@ -558,7 +565,8 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
             cmd.arg("-metadata").arg(format!("{key}={value}"));
         }
     }
-    cmd.args(["-progress", "pipe:1", "-nostats", out])
+    cmd.args(["-progress", "pipe:1", "-nostats"])
+        .arg(&tmp)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -613,28 +621,40 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
 
     let success = matches!(child.wait().await, Ok(s) if s.success());
     if success {
-        let size = tokio::fs::metadata(out).await.map(|m| m.len()).unwrap_or(0);
+        let size = tokio::fs::metadata(&tmp).await.map(|m| m.len()).unwrap_or(0);
         let size_mb = size as f64 / 1_048_576.0;
 
-        // For a "keep on server" job, move the finished file out of the cache dir
-        // into the permanent media library so the TTL cleanup never touches it.
+        // Publish the completed `.part` file: a "keep on server" job moves it
+        // straight into the media library (so the TTL cleanup never touches it),
+        // otherwise it's renamed to the canonical cache name.
         let (final_path, kept, msg) = if keep {
             let dest = prepare_media_path(&st.cfg.media_dir, &relpath);
-            match move_file(out, &dest).await {
+            match move_file(&tmp, &dest).await {
                 Ok(()) => {
                     remember_media(st, key, &dest);
                     log(format!("[{id}] KLAAR: opgeslagen op mediaserver: {dest} ({size_mb:.1} MB)"));
                     (dest.clone(), true, format!("Opgeslagen op de mediaserver: {dest}"))
                 }
                 Err(e) => {
-                    // Fall back to serving from the cache dir if the move failed.
+                    // Couldn't reach the media dir; publish it in the cache instead.
                     log(format!("[{id}] WAARSCHUWING: verplaatsen naar mediaserver mislukt ({e}); blijft in cache"));
-                    (out.to_string(), false, format!("Opgeslagen in cache (verplaatsen mislukte): {out}"))
+                    match move_file(&tmp, out).await {
+                        Ok(()) => (out.to_string(), false, format!("Opgeslagen in cache (verplaatsen mislukte): {out}")),
+                        Err(_) => (tmp.clone(), false, format!("Opgeslagen in cache (verplaatsen mislukte): {tmp}")),
+                    }
                 }
             }
         } else {
-            log(format!("[{id}] KLAAR: {out} ({size_mb:.1} MB)"));
-            (out.to_string(), false, "Download voltooid".to_string())
+            match move_file(&tmp, out).await {
+                Ok(()) => {
+                    log(format!("[{id}] KLAAR: {out} ({size_mb:.1} MB)"));
+                    (out.to_string(), false, "Download voltooid".to_string())
+                }
+                Err(e) => {
+                    log(format!("[{id}] WAARSCHUWING: hernoemen mislukt ({e}); serveer vanaf {tmp}"));
+                    (tmp.clone(), false, "Download voltooid".to_string())
+                }
+            }
         };
 
         set(st, id, |j| {
@@ -646,8 +666,8 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
             j.path = final_path;
         });
     } else {
-        // Drop any partial output so it isn't mistaken for a complete cache hit.
-        tokio::fs::remove_file(out).await.ok();
+        // Drop the partial `.part` output so a retry starts clean.
+        tokio::fs::remove_file(&tmp).await.ok();
         let mut err = String::new();
         if let Some(mut se) = child.stderr.take() {
             se.read_to_string(&mut err).await.ok();

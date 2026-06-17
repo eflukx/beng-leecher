@@ -180,7 +180,10 @@ There are two places a finished file can live:
   they can be recognised later, and are **automatically purged** once older than
   `--cache-ttl` (default 60 minutes). A background task sweeps the directory
   periodically (every TTL/10, clamped to 1–60 min). Set `--cache-ttl 0` to keep
-  cached files indefinitely (no purging).
+  cached files indefinitely (no purging). Downloads are written to a temporary
+  `<id>.mp4.part` file and only renamed to the final name once complete, so a
+  failed or interrupted download never leaves a partial that looks like a finished
+  file (which would block re-downloading); leftover `.part` files are also swept.
 - **Media library (`--media-dir`, default `./media/`)** — used when the
   **Permanent bewaren op de mediaserver** checkbox is ticked, or for *every*
   download when the server is started with `--always-media` (`-M`). The finished
