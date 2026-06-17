@@ -817,26 +817,51 @@ async fn resolve_series(st: &AppState, page_url: &str) -> Result<SeriesResp, Str
         .await
         .map_err(|e| format!("Serie-pagina lezen mislukt: {e}"))?;
 
-    // Episode objects are embedded as backslash-escaped JSON:
-    //   \"id\":\"<id>\",\"title\":\"<title>\",\"seriesTitle\":\"<series>\"
-    let re = Regex::new(
-        r#"\\"id\\":\\"(\d+)\\",\\"title\\":\\"([^\\"]+)\\",\\"seriesTitle\\":\\"([^\\"]+)\\""#,
-    )
-    .unwrap();
+    // The page is a Next.js RSC (React Flight) stream. Decode the embedded
+    // payload into real JSON, then deserialize the episode objects with serde
+    // instead of pattern-matching escaped fields by hand.
+    let flight = flight_payload(&html);
+
+    #[derive(serde::Deserialize)]
+    struct RawEp {
+        id: Option<String>,
+        title: Option<String>,
+        #[serde(rename = "seriesTitle")]
+        series_title: Option<String>,
+    }
 
     let mut seen = HashSet::new();
     let mut episodes = Vec::new();
     let mut series_title = String::new();
-    for c in re.captures_iter(&html) {
-        let id = c[1].to_string();
-        if seen.insert(id.clone()) {
+
+    // Episodes live in one or more `"results":[ … ]` arrays. Let serde_json find
+    // each array's boundary (it respects brackets inside strings) and skip any
+    // array whose elements aren't episode-shaped.
+    let needle = r#""results":"#;
+    let mut from = 0;
+    while let Some(rel) = flight[from..].find(needle) {
+        let arr_start = from + rel + needle.len();
+        from = arr_start;
+        let mut it = serde_json::Deserializer::from_str(&flight[arr_start..])
+            .into_iter::<Vec<RawEp>>();
+        let Some(Ok(items)) = it.next() else { continue };
+        for ep in items {
+            let (Some(id), Some(title)) = (ep.id, ep.title) else { continue };
+            if !id.chars().all(|c| c.is_ascii_digit()) {
+                continue; // episode ids are numeric; skip anything else
+            }
+            if !seen.insert(id.clone()) {
+                continue;
+            }
             if series_title.is_empty() {
-                series_title = html_unescape(&c[3]);
+                if let Some(s) = ep.series_title {
+                    series_title = html_unescape(&s);
+                }
             }
             // The episode id is also its dedup key.
             episodes.push(Episode {
                 url: format!("{base}/aflevering/{id}"),
-                title: html_unescape(&c[2]),
+                title: html_unescape(&title),
                 downloaded: is_downloaded(st, &id),
             });
         }
@@ -860,6 +885,27 @@ async fn resolve_series(st: &AppState, page_url: &str) -> Result<SeriesResp, Str
 }
 
 /// Decode the handful of HTML entities that show up in episode titles.
+/// Reassemble the Next.js RSC (React Flight) payload from a page into one
+/// concatenated string of real, unescaped JSON/text.
+///
+/// The data arrives as `self.__next_f.push([N,"<chunk>"])` calls where each
+/// `<chunk>` is a JSON string literal. Decoding each literal with serde_json
+/// undoes all the escaping (\uXXXX, \", nested backslashes) correctly, which is
+/// far more robust than matching escaped fields with regexes.
+fn flight_payload(html: &str) -> String {
+    static RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        Regex::new(r#"self\.__next_f\.push\(\[\d+,(".*?")\]\)"#).unwrap()
+    });
+    let mut out = String::new();
+    for c in re.captures_iter(html) {
+        if let Ok(s) = serde_json::from_str::<String>(&c[1]) {
+            out.push_str(&s);
+        }
+    }
+    out
+}
+
 fn html_unescape(s: &str) -> String {
     // Decode numeric character references first (&#39; / &#x27; / &#233; …),
     // then the handful of named entities. Do &amp; last so a literal
