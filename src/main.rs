@@ -747,7 +747,7 @@ async fn resolve(
     let title = Regex::new(r"<title>([^<]*)</title>")
         .unwrap()
         .captures(&html)
-        .map(|c| c[1].trim().to_string())
+        .map(|c| html_unescape(c[1].trim()))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "schatkamer-video".into());
 
@@ -861,12 +861,24 @@ async fn resolve_series(st: &AppState, page_url: &str) -> Result<SeriesResp, Str
 
 /// Decode the handful of HTML entities that show up in episode titles.
 fn html_unescape(s: &str) -> String {
-    s.replace("&amp;", "&")
-        .replace("&#x27;", "'")
-        .replace("&#39;", "'")
+    // Decode numeric character references first (&#39; / &#x27; / &#233; …),
+    // then the handful of named entities. Do &amp; last so a literal
+    // "&amp;#39;" doesn't get turned into an apostrophe.
+    let numeric = Regex::new(r"&#(x?)([0-9A-Fa-f]+);").unwrap();
+    let decoded = numeric.replace_all(s, |c: &regex::Captures| {
+        let radix = if &c[1] == "x" { 16 } else { 10 };
+        u32::from_str_radix(&c[2], radix)
+            .ok()
+            .and_then(char::from_u32)
+            .map(|ch| ch.to_string())
+            .unwrap_or_else(|| c[0].to_string())
+    });
+    decoded
         .replace("&quot;", "\"")
         .replace("&lt;", "<")
         .replace("&gt;", ">")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
 }
 
 async fn probe_duration(master: &str, cookie: &str) -> Option<f64> {
@@ -1011,7 +1023,7 @@ async fn fetch_meta(client: &reqwest::Client, url: &str) -> (String, Option<Stri
     let title = Regex::new(r"<title>([^<]*)</title>")
         .unwrap()
         .captures(&html)
-        .map(|c| c[1].trim().to_string())
+        .map(|c| html_unescape(c[1].trim()))
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "schatkamer-video".into());
     (title, extract_date(&html))
