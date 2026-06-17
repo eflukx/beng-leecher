@@ -565,7 +565,9 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
             cmd.arg("-metadata").arg(format!("{key}={value}"));
         }
     }
-    cmd.args(["-progress", "pipe:1", "-nostats"])
+    // The output name ends in `.part`, so ffmpeg can't infer the container —
+    // state it explicitly.
+    cmd.args(["-f", "mp4", "-progress", "pipe:1", "-nostats"])
         .arg(&tmp)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
