@@ -52,6 +52,8 @@ struct Config {
     include_metadata: bool,
     /// Maximum number of episodes downloaded at once.
     max_concurrent: usize,
+    /// Always save to the media library, regardless of the per-job "keep" toggle.
+    always_media: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -238,6 +240,7 @@ fn parse_args() -> Config {
         include_date: true,
         include_metadata: true,
         max_concurrent: DEFAULT_MAX_CONCURRENT,
+        always_media: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -245,6 +248,7 @@ fn parse_args() -> Config {
             "-a" | "--address" => cfg.addr = next_value(&mut args, &a),
             "-m" | "--media-dir" => cfg.media_dir = next_value(&mut args, &a),
             "-f" | "--series-folders" => cfg.series_folders = true,
+            "-M" | "--always-media" => cfg.always_media = true,
             "--no-date" => cfg.include_date = false,
             "--no-metadata" => cfg.include_metadata = false,
             "-j" | "--max-concurrent" => {
@@ -276,6 +280,7 @@ fn parse_args() -> Config {
                        -m, --media-dir <pad>        Map voor permanent bewaarde bestanden (standaard {DEFAULT_MEDIA_DIR})\n  \
                        -t, --cache-ttl <duur>       Bewaartijd tijdelijke downloads, bijv. 30m/2h/1d, 0=uit (standaard {DEFAULT_CACHE_TTL})\n  \
                        -f, --series-folders         Bewaar per programma in een eigen submap (<serie>/<aflevering>.mp4)\n  \
+                       -M, --always-media           Bewaar alles in de mediabibliotheek (negeer de 'bewaren'-vinkjes)\n  \
                        -j, --max-concurrent <n>     Max. gelijktijdige downloads (standaard {DEFAULT_MAX_CONCURRENT})\n  \
                            --no-date                Voeg de uitzenddatum NIET toe aan de bestandsnaam (standaard wel)\n  \
                            --no-metadata            Schrijf GEEN metadata (titel/serie/datum/beschrijving) in de MP4 (standaard wel)\n  \
@@ -370,6 +375,7 @@ async fn config(State(st): State<AppState>) -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "media_dir": st.cfg.media_dir,
         "cache_ttl_secs": st.cfg.cache_ttl_secs,
+        "always_media": st.cfg.always_media,
     }))
 }
 
@@ -382,9 +388,11 @@ async fn series(State(st): State<AppState>, Json(req): Json<SeriesReq>) -> Respo
 }
 
 async fn start(State(st): State<AppState>, Json(req): Json<DownloadReq>) -> Json<StartResp> {
+    // The server-wide --always-media flag forces every job to the media library.
+    let keep = req.keep || st.cfg.always_media;
     let id = new_id();
     let mut job = Job::new();
-    job.kept = req.keep;
+    job.kept = keep;
     st.jobs.lock().unwrap().insert(id.clone(), job);
 
     let st2 = st.clone();
@@ -392,9 +400,9 @@ async fn start(State(st): State<AppState>, Json(req): Json<DownloadReq>) -> Json
     let url = req.url.trim().to_string();
     log(format!(
         "[{id}] nieuwe taak aangevraagd ({}): {url}",
-        if req.keep { "mediaserver" } else { "client" }
+        if keep { "mediaserver" } else { "client" }
     ));
-    tokio::spawn(async move { run_job(st2, id2, url, req.keep).await });
+    tokio::spawn(async move { run_job(st2, id2, url, keep).await });
 
     Json(StartResp { id })
 }
@@ -460,7 +468,7 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
             let (title, date) = fetch_meta(&st.client, &page_url).await;
             let relpath = media_relpath(&title, date.as_deref(), st.cfg.series_folders, st.cfg.include_date);
             let dest = prepare_media_path(&st.cfg.media_dir, &relpath);
-            match tokio::fs::rename(&cache, &dest).await {
+            match move_file(&cache, &dest).await {
                 Ok(()) => {
                     remember_media(&st, &key, &dest);
                     return finish_ok(&st, &id, &dest, true, "Was al in cache — verplaatst naar mediabibliotheek");
@@ -612,7 +620,7 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
         // into the permanent media library so the TTL cleanup never touches it.
         let (final_path, kept, msg) = if keep {
             let dest = prepare_media_path(&st.cfg.media_dir, &relpath);
-            match tokio::fs::rename(out, &dest).await {
+            match move_file(out, &dest).await {
                 Ok(()) => {
                     remember_media(st, key, &dest);
                     log(format!("[{id}] KLAAR: opgeslagen op mediaserver: {dest} ({size_mb:.1} MB)"));
@@ -1114,6 +1122,20 @@ fn log(msg: impl AsRef<str>) {
 /// Ensure the parent directory exists and return a non-colliding path in the
 /// media dir for `relpath` (which may contain a `<series>/` prefix), appending
 /// " (2)", " (3)", … if a file with that name already exists.
+/// Move a file, falling back to copy+delete when `rename` can't cross
+/// filesystems (EXDEV). The media dir is often a separate mount (NAS, another
+/// disk, a bind volume) from the cache dir, where a plain rename always fails.
+async fn move_file(src: &str, dst: &str) -> std::io::Result<()> {
+    match tokio::fs::rename(src, dst).await {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            tokio::fs::copy(src, dst).await?;
+            tokio::fs::remove_file(src).await?;
+            Ok(())
+        }
+    }
+}
+
 fn prepare_media_path(dir: &str, relpath: &str) -> String {
     let full = format!("{dir}/{relpath}");
     if let Some(parent) = std::path::Path::new(&full).parent() {

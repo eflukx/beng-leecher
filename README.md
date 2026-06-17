@@ -80,6 +80,7 @@ the full ffmpeg stderr on failure), so you can always see what's going on.
 | `-m`, `--media-dir`     | `media`        | Directory for permanently-kept ("save to server") files.               |
 | `-t`, `--cache-ttl`     | `60m`          | How long throwaway downloads survive before being purged. `0` disables. |
 | `-f`, `--series-folders`| off            | Store kept files in a per-program subfolder (`<series>/<episode>.mp4`). |
+| `-M`, `--always-media`  | off            | Save every download to the media library, ignoring the UI "keep" toggle. |
 | `-j`, `--max-concurrent`| `3`            | Max episodes downloaded at once (limits CloudFront rate-limiting).      |
 | `--no-date`             | (date on)      | Don't append the broadcast date `(YYYY-MM-DD)` to filenames.            |
 | `--no-metadata`         | (metadata on)  | Don't write episode metadata tags into the MP4.                         |
@@ -181,14 +182,29 @@ There are two places a finished file can live:
   periodically (every TTL/10, clamped to 1–60 min). Set `--cache-ttl 0` to keep
   cached files indefinitely (no purging).
 - **Media library (`--media-dir`, default `./media/`)** — used when the
-  **Permanent bewaren op de mediaserver** checkbox is ticked. The finished file
-  is moved here under its episode title (e.g.
+  **Permanent bewaren op de mediaserver** checkbox is ticked, or for *every*
+  download when the server is started with `--always-media` (`-M`). The finished
+  file is moved here under its episode title (e.g.
   `media/WE ZIJN WEER THUIS - Afl_ 11_ Water in wijn.mp4`), with a numeric
   suffix on name collisions, and is **never** touched by the cache cleanup. This
   is the "download to the media server instead of the web client" mode — you can
   fire off a download and leave it on the server; downloading it to your browser
   afterwards is optional. A small `media/.beng_leecher_index.json` maps episode
   ids to their saved filenames so kept files are recognised across restarts.
+
+The move from cache to the media library works even when the two live on
+**different filesystems** (e.g. the media dir is a NAS or another mount): a plain
+rename across devices fails, so the tool falls back to copy-then-delete.
+
+### Always saving to the media library
+
+Start the server with `--always-media` (`-M`) to send every download straight to
+the media library without ticking anything in the UI (the "keep" toggles are
+shown ticked and locked). The flag also doubles as a **fix for episodes already
+sitting in the cache**: re-paste the same episode or series URL with `-M` on, and
+each already-downloaded episode is **promoted from the cache into the media
+library without being re-downloaded** (the cache hit is detected and the file is
+moved, using the page's title/series/date for the destination name).
 
 Jobs are tracked in memory; a kept file persists on disk regardless, while a
 cached file disappears from the job list when it is purged.

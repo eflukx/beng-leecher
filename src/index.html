@@ -144,13 +144,22 @@ const $ = id => document.getElementById(id);
 const MAX_FAILS = 10;            // ~6s of failed polls before a row gives up
 
 let cacheTtl = 0;
+let alwaysMedia = false;
 fetch('/api/config').then(r => r.json()).then(cfg => {
   cacheTtl = cfg.cache_ttl_secs || 0;
+  alwaysMedia = !!cfg.always_media;
   const ttlMin = Math.round(cacheTtl / 60);
   const note = cacheTtl > 0
     ? `anders na ${ttlMin} min van de server verwijderd`
     : `anders blijven ze tijdelijk op de server staan`;
-  $('keepText').textContent = `Permanent bewaren op de mediaserver (${note})`;
+  if (alwaysMedia) {
+    // Server forces every download into the media library (--always-media):
+    // tick and lock the toggles so the UI reflects that the choice is fixed.
+    $('keepText').textContent = `Altijd opslaan in de mediabibliotheek (ingesteld op de server)`;
+    for (const el of [$('keep'), $('mKeep')]) { el.checked = true; el.disabled = true; }
+  } else {
+    $('keepText').textContent = `Permanent bewaren op de mediaserver (${note})`;
+  }
 }).catch(() => {});
 
 const isSeries = u => u.includes('/serie/') && !u.includes('/aflevering/');
