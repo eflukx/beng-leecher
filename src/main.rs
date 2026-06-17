@@ -39,6 +39,13 @@ struct Config {
     media_dir: String,
     /// Seconds to keep files in DOWNLOAD_DIR before purging; 0 disables purging.
     cache_ttl_secs: u64,
+    /// When true, kept files go into a per-program subfolder of the media dir
+    /// (e.g. `<series>/<episode>.mp4` instead of `<series> - <episode>.mp4`).
+    series_folders: bool,
+    /// Append the broadcast date ` (YYYY-MM-DD)` to filenames (default on).
+    include_date: bool,
+    /// Write episode metadata (title/show/date/description) into the MP4 (default on).
+    include_metadata: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -124,6 +131,14 @@ async fn main() {
     std::fs::create_dir_all(&cfg.media_dir).ok();
     log(format!("cache (tijdelijk): {DOWNLOAD_DIR}/"));
     log(format!("mediabibliotheek (permanent): {}/", cfg.media_dir));
+    if cfg.series_folders {
+        log("mediabibliotheek-indeling: submap per programma (<serie>/<aflevering>.mp4)".to_string());
+    }
+    log(format!(
+        "uitzenddatum in bestandsnaam: {} | metadata in MP4: {}",
+        if cfg.include_date { "aan" } else { "uit" },
+        if cfg.include_metadata { "aan" } else { "uit" }
+    ));
     if cfg.cache_ttl_secs == 0 {
         log("cache TTL: uit — tijdelijke bestanden worden niet opgeruimd".to_string());
     } else {
@@ -209,12 +224,18 @@ fn parse_args() -> Config {
         addr: DEFAULT_ADDR.to_string(),
         media_dir: DEFAULT_MEDIA_DIR.to_string(),
         cache_ttl_secs: parse_duration(DEFAULT_CACHE_TTL).unwrap(),
+        series_folders: false,
+        include_date: true,
+        include_metadata: true,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "-a" | "--address" => cfg.addr = next_value(&mut args, &a),
             "-m" | "--media-dir" => cfg.media_dir = next_value(&mut args, &a),
+            "-f" | "--series-folders" => cfg.series_folders = true,
+            "--no-date" => cfg.include_date = false,
+            "--no-metadata" => cfg.include_metadata = false,
             "-t" | "--cache-ttl" => {
                 let raw = next_value(&mut args, &a);
                 match parse_duration(&raw) {
@@ -233,6 +254,9 @@ fn parse_args() -> Config {
                        -a, --address   <host:port>  Luisteradres (standaard {DEFAULT_ADDR})\n  \
                        -m, --media-dir <pad>        Map voor permanent bewaarde bestanden (standaard {DEFAULT_MEDIA_DIR})\n  \
                        -t, --cache-ttl <duur>       Bewaartijd tijdelijke downloads, bijv. 30m/2h/1d, 0=uit (standaard {DEFAULT_CACHE_TTL})\n  \
+                       -f, --series-folders         Bewaar per programma in een eigen submap (<serie>/<aflevering>.mp4)\n  \
+                           --no-date                Voeg de uitzenddatum NIET toe aan de bestandsnaam (standaard wel)\n  \
+                           --no-metadata            Schrijf GEEN metadata (titel/serie/datum/beschrijving) in de MP4 (standaard wel)\n  \
                        -h, --help                   Toon deze hulp"
                 );
                 std::process::exit(0);
@@ -411,8 +435,9 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
         if keep {
             // Wanted permanently but only cached: promote without re-downloading.
             log(format!("[{id}] al in cache; verplaatsen naar mediabibliotheek (geen nieuwe download)"));
-            let title = fetch_title(&st.client, &page_url).await;
-            let dest = unique_media_path(&st.cfg.media_dir, &format!("{}.mp4", sanitize(&title)));
+            let (title, date) = fetch_meta(&st.client, &page_url).await;
+            let relpath = media_relpath(&title, date.as_deref(), st.cfg.series_folders, st.cfg.include_date);
+            let dest = prepare_media_path(&st.cfg.media_dir, &relpath);
             match tokio::fs::rename(&cache, &dest).await {
                 Ok(()) => {
                     remember_media(&st, &key, &dest);
@@ -447,19 +472,34 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
     });
     log(format!("[{id}] stap 1/3: episodepagina ophalen en stream opzoeken"));
 
-    let (master, cookie, title) = match resolve(&st.client, id, page_url).await {
+    let Resolved {
+        master,
+        cookie,
+        title,
+        date,
+        description,
+    } = match resolve(&st.client, id, page_url).await {
         Ok(v) => v,
         Err(e) => {
             log(format!("[{id}] FOUT tijdens opzoeken: {e}"));
             return fail(st, id, e);
         }
     };
-    log(format!("[{id}] titel: {title}"));
+    log(format!(
+        "[{id}] titel: {title}{}",
+        date.as_deref().map(|d| format!(" ({d})")).unwrap_or_default()
+    ));
 
-    let filename = format!("{}.mp4", sanitize(&title));
+    // The media-relative path (possibly `<series>/<episode> (date).mp4`); the
+    // browser download name is just its basename.
+    let relpath = media_relpath(&title, date.as_deref(), st.cfg.series_folders, st.cfg.include_date);
+    let download_name = std::path::Path::new(&relpath)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "video.mp4".into());
     set(st, id, |j| {
         j.title = title.clone();
-        j.filename = filename.clone();
+        j.filename = download_name.clone();
         j.status = "Downloaden…".into();
     });
 
@@ -467,29 +507,23 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
     log(format!("[{id}] duur volgens ffprobe: {duration:.0} sec"));
     log(format!("[{id}] stap 3/3: ffmpeg start, muxt naar {out}"));
 
-    let mut child = match Command::new("ffmpeg")
-        .args(["-y", "-loglevel", "error", "-headers"])
+    let mut cmd = Command::new("ffmpeg");
+    cmd.args(["-y", "-loglevel", "error", "-headers"])
         .arg(format!("Cookie: {cookie}\r\n"))
         .args([
-            "-i",
-            &master,
-            "-map",
-            "0:v:0",
-            "-map",
-            "0:a:0",
-            "-c",
-            "copy",
-            "-movflags",
+            "-i", &master, "-map", "0:v:0", "-map", "0:a:0", "-c", "copy", "-movflags",
             "+faststart",
-            "-progress",
-            "pipe:1",
-            "-nostats",
-            out,
-        ])
+        ]);
+    if st.cfg.include_metadata {
+        for (key, value) in metadata_tags(&title, date.as_deref(), description.as_deref()) {
+            cmd.arg("-metadata").arg(format!("{key}={value}"));
+        }
+    }
+    cmd.args(["-progress", "pipe:1", "-nostats", out])
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
             log(format!("[{id}] FOUT: ffmpeg kon niet starten: {e}"));
@@ -546,7 +580,7 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
         // For a "keep on server" job, move the finished file out of the cache dir
         // into the permanent media library so the TTL cleanup never touches it.
         let (final_path, kept, msg) = if keep {
-            let dest = unique_media_path(&st.cfg.media_dir, &filename);
+            let dest = prepare_media_path(&st.cfg.media_dir, &relpath);
             match tokio::fs::rename(out, &dest).await {
                 Ok(()) => {
                     remember_media(st, key, &dest);
@@ -589,13 +623,23 @@ async fn run_pipeline(st: &AppState, id: &str, page_url: &str, key: &str, out: &
     }
 }
 
+/// What an episode page yields: the playable stream plus metadata for the
+/// filename and the muxed file's tags.
+struct Resolved {
+    master: String,
+    cookie: String,
+    title: String,
+    date: Option<String>,
+    description: Option<String>,
+}
+
 /// Fetch the episode page, extract the signed master playlist URL, perform the
-/// CloudFront cookie handshake, and return (unsigned master URL, Cookie header, title).
+/// CloudFront cookie handshake, and return the stream + episode metadata.
 async fn resolve(
     client: &reqwest::Client,
     id: &str,
     page_url: &str,
-) -> Result<(String, String, String), String> {
+) -> Result<Resolved, String> {
     if !page_url.starts_with("http") {
         return Err("Geef een geldige http(s)-URL op.".into());
     }
@@ -658,7 +702,48 @@ async fn resolve(
         .filter(|t| !t.is_empty())
         .unwrap_or_else(|| "schatkamer-video".into());
 
-    Ok((master_plain, cookie, title))
+    let date = extract_date(&html);
+    let description = extract_description(&html, &episode_key(page_url));
+
+    Ok(Resolved {
+        master: master_plain,
+        cookie,
+        title,
+        date,
+        description,
+    })
+}
+
+/// Pull the episode's broadcast date (YYYY-MM-DD) from `publishedAtISO`.
+fn extract_date(html: &str) -> Option<String> {
+    Regex::new(r#"\\"publishedAtISO\\":\\"(\d{4}-\d{2}-\d{2})"#)
+        .unwrap()
+        .captures(html)
+        .map(|c| c[1].to_string())
+}
+
+/// Pull *this episode's* description from the page JSON and unescape it to a
+/// single tidy line for a metadata tag. Anchored to the episode id so it can't
+/// grab the site-wide meta description.
+fn extract_description(html: &str, episode_key: &str) -> Option<String> {
+    // `[^{}]` keeps the match inside the one flat JSON object that holds the id.
+    let pat = r#"\\"id\\":\\"__ID__\\"[^{}]*?\\"description\\":\\"(.*?)\\""#
+        .replace("__ID__", &regex::escape(episode_key));
+    let raw = Regex::new(&pat).ok()?.captures(html).map(|c| c[1].to_string())?;
+    let cleaned = raw
+        .replace("\\\\", "\\") // page double-escapes: collapse `\\` to `\` first
+        .replace("\\n", " ")
+        .replace("\\r", " ")
+        .replace("\\t", " ")
+        .replace("\\u0026", "&")
+        .replace("\\\"", "\"");
+    let cleaned = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let cleaned = html_unescape(&cleaned);
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned)
+    }
 }
 
 /// Fetch a series page (forcing `alleenafspeelbaar=ja` so only playable episodes
@@ -834,15 +919,14 @@ fn is_downloaded(st: &AppState, key: &str) -> bool {
     false
 }
 
-/// Record a kept file in the media index and persist it.
+/// Record a kept file in the media index and persist it. The stored value is the
+/// path relative to the media dir (so it keeps any `<series>/` subfolder).
 fn remember_media(st: &AppState, key: &str, dest_path: &str) {
-    let filename = std::path::Path::new(dest_path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+    let prefix = format!("{}/", st.cfg.media_dir);
+    let relpath = dest_path.strip_prefix(&prefix).unwrap_or(dest_path).to_string();
     let snapshot = {
         let mut idx = st.media_index.lock().unwrap();
-        idx.insert(key.to_string(), filename);
+        idx.insert(key.to_string(), relpath);
         idx.clone()
     };
     save_media_index(&st.cfg.media_dir, &snapshot);
@@ -868,19 +952,20 @@ fn save_media_index(dir: &str, map: &HashMap<String, String>) {
     }
 }
 
-/// Lightweight fetch of just the episode page `<title>` (used when promoting a
-/// cached file to the media library without re-downloading).
-async fn fetch_title(client: &reqwest::Client, url: &str) -> String {
+/// Lightweight fetch of the episode page `<title>` and broadcast date (used when
+/// promoting a cached file to the media library without re-downloading).
+async fn fetch_meta(client: &reqwest::Client, url: &str) -> (String, Option<String>) {
     let html = match client.get(url).send().await {
         Ok(r) => r.text().await.unwrap_or_default(),
         Err(_) => String::new(),
     };
-    Regex::new(r"<title>([^<]*)</title>")
+    let title = Regex::new(r"<title>([^<]*)</title>")
         .unwrap()
         .captures(&html)
         .map(|c| c[1].trim().to_string())
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| "schatkamer-video".into())
+        .unwrap_or_else(|| "schatkamer-video".into());
+    (title, extract_date(&html))
 }
 
 fn new_id() -> String {
@@ -909,14 +994,19 @@ fn log(msg: impl AsRef<str>) {
     );
 }
 
-/// Build a non-colliding path in the media dir for `filename`, appending
+/// Ensure the parent directory exists and return a non-colliding path in the
+/// media dir for `relpath` (which may contain a `<series>/` prefix), appending
 /// " (2)", " (3)", … if a file with that name already exists.
-fn unique_media_path(dir: &str, filename: &str) -> String {
-    let (stem, ext) = match filename.rsplit_once('.') {
+fn prepare_media_path(dir: &str, relpath: &str) -> String {
+    let full = format!("{dir}/{relpath}");
+    if let Some(parent) = std::path::Path::new(&full).parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    let (stem, ext) = match relpath.rsplit_once('.') {
         Some((s, e)) => (s, format!(".{e}")),
-        None => (filename, String::new()),
+        None => (relpath, String::new()),
     };
-    let mut candidate = format!("{dir}/{filename}");
+    let mut candidate = full;
     let mut n = 2;
     while std::path::Path::new(&candidate).exists() {
         candidate = format!("{dir}/{stem} ({n}){ext}");
@@ -925,10 +1015,12 @@ fn unique_media_path(dir: &str, filename: &str) -> String {
     candidate
 }
 
-/// Turn a page title into a safe-ish filename stem (drop the " | De Schatkamer" suffix).
-fn sanitize(s: &str) -> String {
-    let base = s.split('|').next().unwrap_or(s).trim();
-    let cleaned: String = base
+/// Sanitize one path component (series name or episode title) into something
+/// safe for a filename: keep letters/digits/space/dash/underscore, collapse
+/// runs of whitespace, replace the rest with `_`.
+fn sanitize_part(s: &str) -> String {
+    let cleaned: String = s
+        .trim()
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c == ' ' || c == '-' || c == '_' {
@@ -944,6 +1036,56 @@ fn sanitize(s: &str) -> String {
     } else {
         cleaned
     }
+}
+
+/// Turn an episode page `<title>` ("SERIES - EPISODE | De Schatkamer") into a
+/// media-relative path. With `series_folders`, the series part becomes a
+/// subfolder (`<series>/<episode>.mp4`); otherwise it's flat
+/// (`<series> - <episode>.mp4`). With `include_date` and a known date, the
+/// broadcast date is appended as ` (YYYY-MM-DD)` before the extension.
+fn media_relpath(title: &str, date: Option<&str>, series_folders: bool, include_date: bool) -> String {
+    let base = title.split('|').next().unwrap_or(title).trim();
+    let suffix = match (include_date, date) {
+        (true, Some(d)) if !d.is_empty() => format!(" ({d})"),
+        _ => String::new(),
+    };
+    if series_folders {
+        if let Some((series, episode)) = base.split_once(" - ") {
+            if !series.trim().is_empty() && !episode.trim().is_empty() {
+                return format!("{}/{}{suffix}.mp4", sanitize_part(series), sanitize_part(episode));
+            }
+        }
+    }
+    format!("{}{suffix}.mp4", sanitize_part(base))
+}
+
+/// Metadata tags written into the muxed MP4. Keys understood by ffmpeg's mov
+/// muxer; unknown ones are simply ignored.
+fn metadata_tags(title: &str, date: Option<&str>, description: Option<&str>) -> Vec<(&'static str, String)> {
+    let base = title.split('|').next().unwrap_or(title).trim();
+    let (show, episode) = match base.split_once(" - ") {
+        Some((s, e)) if !s.trim().is_empty() && !e.trim().is_empty() => {
+            (Some(s.trim().to_string()), e.trim().to_string())
+        }
+        _ => (None, base.to_string()),
+    };
+    let mut tags = vec![("title", episode)];
+    if let Some(s) = show {
+        tags.push(("show", s));
+    }
+    if let Some(d) = date {
+        if !d.is_empty() {
+            tags.push(("date", d.to_string()));
+        }
+    }
+    if let Some(desc) = description {
+        if !desc.is_empty() {
+            for key in ["description", "synopsis", "comment"] {
+                tags.push((key, desc.to_string()));
+            }
+        }
+    }
+    tags
 }
 
 const INDEX_HTML: &str = include_str!("index.html");

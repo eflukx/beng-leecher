@@ -74,15 +74,35 @@ the full ffmpeg stderr on failure), so you can always see what's going on.
 
 ### Command-line options
 
-| Flag                  | Default        | Meaning                                                                 |
-| --------------------- | -------------- | ----------------------------------------------------------------------- |
-| `-a`, `--address`     | `0.0.0.0:3380` | Listen address (`host:port`).                                           |
-| `-m`, `--media-dir`   | `media`        | Directory for permanently-kept ("save to server") files.               |
-| `-t`, `--cache-ttl`   | `60m`          | How long throwaway downloads survive before being purged. `0` disables. |
-| `-h`, `--help`        | —              | Show help.                                                              |
+| Flag                    | Default        | Meaning                                                                 |
+| ----------------------- | -------------- | ----------------------------------------------------------------------- |
+| `-a`, `--address`       | `0.0.0.0:3380` | Listen address (`host:port`).                                           |
+| `-m`, `--media-dir`     | `media`        | Directory for permanently-kept ("save to server") files.               |
+| `-t`, `--cache-ttl`     | `60m`          | How long throwaway downloads survive before being purged. `0` disables. |
+| `-f`, `--series-folders`| off            | Store kept files in a per-program subfolder (`<series>/<episode>.mp4`). |
+| `--no-date`             | (date on)      | Don't append the broadcast date `(YYYY-MM-DD)` to filenames.            |
+| `--no-metadata`         | (metadata on)  | Don't write episode metadata tags into the MP4.                         |
+| `-h`, `--help`          | —              | Show help.                                                              |
 
 Durations accept `s`/`m`/`h`/`d` suffixes (e.g. `90s`, `30m`, `6h`, `1d`); a
 bare number is interpreted as minutes.
+
+### Filenames & metadata
+
+Kept files are named from the episode page title, which has the form
+`<series> - <episode>`. By default the broadcast date is appended, e.g.
+`WE ZIJN WEER THUIS - Afl. 11_ Water in wijn (1991-12-15).mp4`. With
+`--series-folders` (`-f`) the series part becomes a folder instead:
+
+```
+media/WE ZIJN WEER THUIS/Afl. 11_ Water in wijn (1991-12-15).mp4
+```
+
+Unless `--no-metadata` is given, each MP4 is tagged with the episode `title`,
+`show` (series), `date`, and the episode `description` (written to the
+`description`, `synopsis` and `comment` tags), so media players show proper
+titles and synopses. The date and description are read from the episode page
+(`publishedAtISO` and the episode's `description` field).
 
 By default the server binds to `0.0.0.0:3380`, i.e. **all network interfaces**,
 so it's reachable from other machines on your network — not just loopback. Use
