@@ -34,6 +34,9 @@ const DEFAULT_CACHE_TTL: &str = "60m";
 const DEFAULT_MAX_CONCURRENT: usize = 3;
 /// Working directory for browser-bound downloads; subject to the cache TTL.
 const DOWNLOAD_DIR: &str = "downloads";
+/// Default number of listing pages (24 episodes each) prefetched for a series.
+/// Keeps the popup snappy for shows with thousands of episodes.
+const DEFAULT_SERIES_MAX_PAGES: u32 = 4;
 
 /// Runtime configuration assembled from CLI arguments.
 #[derive(Clone)]
@@ -57,6 +60,8 @@ struct Config {
     /// Show every client the same job list (global) instead of per-client
     /// (scoped by a random cookie).
     global_status: bool,
+    /// How many listing pages (24 episodes each) to prefetch for a series popup.
+    series_max_pages: u32,
 }
 
 #[derive(Clone, Serialize)]
@@ -139,6 +144,10 @@ struct Episode {
 struct SeriesResp {
     series_title: String,
     episodes: Vec<Episode>,
+    /// Total playable episodes the site reports for this (filtered) series.
+    total: Option<usize>,
+    /// True when more episodes exist than were prefetched (page cap reached).
+    truncated: bool,
 }
 
 #[tokio::main]
@@ -158,6 +167,11 @@ async fn main() {
         if cfg.include_metadata { "aan" } else { "uit" }
     ));
     log(format!("max. gelijktijdige downloads: {}", cfg.max_concurrent));
+    log(format!(
+        "serie-prefetch: max. {} pagina('s) (~{} afleveringen)",
+        cfg.series_max_pages,
+        cfg.series_max_pages * 24
+    ));
     log(format!(
         "takenlijst: {}",
         if cfg.global_status {
@@ -259,6 +273,7 @@ fn parse_args() -> Config {
         max_concurrent: DEFAULT_MAX_CONCURRENT,
         always_media: false,
         global_status: false,
+        series_max_pages: DEFAULT_SERIES_MAX_PAGES,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -274,6 +289,16 @@ fn parse_args() -> Config {
                 let raw = next_value(&mut args, &a);
                 match raw.parse::<usize>() {
                     Ok(n) if n >= 1 => cfg.max_concurrent = n,
+                    _ => {
+                        eprintln!("Ongeldige waarde voor {a}: '{raw}' (geef een getal >= 1).");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            "-p" | "--max-pages" => {
+                let raw = next_value(&mut args, &a);
+                match raw.parse::<u32>() {
+                    Ok(n) if n >= 1 => cfg.series_max_pages = n,
                     _ => {
                         eprintln!("Ongeldige waarde voor {a}: '{raw}' (geef een getal >= 1).");
                         std::process::exit(2);
@@ -302,6 +327,7 @@ fn parse_args() -> Config {
                        -M, --always-media           Bewaar alles in de mediabibliotheek (negeer de 'bewaren'-vinkjes)\n  \
                        -g, --global-status          Toon alle clients dezelfde takenlijst (standaard: per client via cookie)\n  \
                        -j, --max-concurrent <n>     Max. gelijktijdige downloads (standaard {DEFAULT_MAX_CONCURRENT})\n  \
+                       -p, --max-pages <n>          Aantal serie-pagina's vooraf op te halen, 24 afl./pagina (standaard {DEFAULT_SERIES_MAX_PAGES})\n  \
                            --no-date                Voeg de uitzenddatum NIET toe aan de bestandsnaam (standaard wel)\n  \
                            --no-metadata            Schrijf GEEN metadata (titel/serie/datum/beschrijving) in de MP4 (standaard wel)\n  \
                        -h, --help                   Toon deze hulp"
@@ -921,32 +947,29 @@ fn extract_description(html: &str, episode_key: &str) -> Option<String> {
     (!desc.is_empty()).then_some(desc)
 }
 
-/// Fetch a series page (forcing `alleenafspeelbaar=ja` so only playable episodes
-/// are listed) and extract its episodes as (url, title) pairs in page order.
+/// Fetch a series listing and extract its episodes as (url, title) pairs in page
+/// order. The user's filter params (`mediumtype`, `omroep`, `persoon`, …) are
+/// preserved; we force `alleenafspeelbaar=ja` (only playable) and walk all
+/// pages, since the listing is paginated at 24 episodes per `pagina=N`.
 async fn resolve_series(st: &AppState, page_url: &str) -> Result<SeriesResp, String> {
     if !page_url.starts_with("http") || !page_url.contains("/serie/") {
         return Err("Geef een geldige serie-URL op.".into());
     }
 
-    // Drop any existing query and force the "only playable" filter.
-    let base = page_url.split('?').next().unwrap_or(page_url).trim_end_matches('/');
-    let fetch_url = format!("{base}?alleenafspeelbaar=ja");
-    log(format!("serie ophalen: {fetch_url}"));
-
-    let html = st
-        .client
-        .get(&fetch_url)
-        .send()
-        .await
-        .map_err(|e| format!("Serie-pagina ophalen mislukt: {e}"))?
-        .text()
-        .await
-        .map_err(|e| format!("Serie-pagina lezen mislukt: {e}"))?;
-
-    // The page is a Next.js RSC (React Flight) stream. Decode the embedded
-    // payload into real JSON, then deserialize the episode objects with serde
-    // instead of pattern-matching escaped fields by hand.
-    let flight = flight_payload(&html);
+    // Split path from query. Keep the user's filters but manage the playable
+    // filter and pagination ourselves.
+    let (base, query) = match page_url.split_once('?') {
+        Some((b, q)) => (b.trim_end_matches('/'), q),
+        None => (page_url.trim_end_matches('/'), ""),
+    };
+    let kept_params: Vec<&str> = query
+        .split('&')
+        .filter(|kv| !kv.is_empty())
+        .filter(|kv| {
+            let k = kv.split('=').next().unwrap_or("");
+            k != "pagina" && k != "alleenafspeelbaar"
+        })
+        .collect();
 
     #[derive(serde::Deserialize)]
     struct RawEp {
@@ -959,37 +982,79 @@ async fn resolve_series(st: &AppState, page_url: &str) -> Result<SeriesResp, Str
     let mut seen = HashSet::new();
     let mut episodes = Vec::new();
     let mut series_title = String::new();
+    let mut total: Option<usize> = None;
 
-    // Episodes live in one or more `"results":[ … ]` arrays. Let serde_json find
-    // each array's boundary (it respects brackets inside strings) and skip any
-    // array whose elements aren't episode-shaped.
-    let needle = r#""results":"#;
-    let mut from = 0;
-    while let Some(rel) = flight[from..].find(needle) {
-        let arr_start = from + rel + needle.len();
-        from = arr_start;
-        let mut it = serde_json::Deserializer::from_str(&flight[arr_start..])
-            .into_iter::<Vec<RawEp>>();
-        let Some(Ok(items)) = it.next() else { continue };
-        for ep in items {
-            let (Some(id), Some(title)) = (ep.id, ep.title) else { continue };
-            if !id.chars().all(|c| c.is_ascii_digit()) {
-                continue; // episode ids are numeric; skip anything else
-            }
-            if !seen.insert(id.clone()) {
-                continue;
-            }
-            if series_title.is_empty() {
-                if let Some(s) = ep.series_title {
-                    series_title = html_unescape(&s);
+    for page in 1..=st.cfg.series_max_pages {
+        let pag = format!("pagina={page}");
+        let mut parts = kept_params.clone();
+        parts.push("alleenafspeelbaar=ja");
+        parts.push(&pag);
+        let fetch_url = format!("{base}?{}", parts.join("&"));
+        log(format!("serie ophalen (pagina {page}): {fetch_url}"));
+
+        // The page is a Next.js RSC (React Flight) stream. Decode the embedded
+        // payload into real JSON, then deserialize the episode objects with serde
+        // instead of pattern-matching escaped fields by hand.
+        let html = st
+            .client
+            .get(&fetch_url)
+            .send()
+            .await
+            .map_err(|e| format!("Serie-pagina ophalen mislukt: {e}"))?
+            .text()
+            .await
+            .map_err(|e| format!("Serie-pagina lezen mislukt: {e}"))?;
+        let flight = flight_payload(&html);
+
+        if total.is_none() {
+            total = Regex::new(r#""total":(\d+)"#)
+                .unwrap()
+                .captures(&flight)
+                .and_then(|c| c[1].parse::<usize>().ok());
+        }
+
+        // Episodes live in one or more `"results":[ … ]` arrays. Let serde_json
+        // find each array's boundary (it respects brackets inside strings) and
+        // skip any array whose elements aren't episode-shaped.
+        let before = episodes.len();
+        let needle = r#""results":"#;
+        let mut from = 0;
+        while let Some(rel) = flight[from..].find(needle) {
+            let arr_start = from + rel + needle.len();
+            from = arr_start;
+            let mut it = serde_json::Deserializer::from_str(&flight[arr_start..])
+                .into_iter::<Vec<RawEp>>();
+            let Some(Ok(items)) = it.next() else { continue };
+            for ep in items {
+                let (Some(id), Some(title)) = (ep.id, ep.title) else { continue };
+                if !id.chars().all(|c| c.is_ascii_digit()) {
+                    continue; // episode ids are numeric; skip anything else
                 }
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if series_title.is_empty() {
+                    if let Some(s) = ep.series_title {
+                        series_title = html_unescape(&s);
+                    }
+                }
+                // The episode id is also its dedup key.
+                episodes.push(Episode {
+                    url: format!("{base}/aflevering/{id}"),
+                    title: html_unescape(&title),
+                    downloaded: is_downloaded(st, &id),
+                });
             }
-            // The episode id is also its dedup key.
-            episodes.push(Episode {
-                url: format!("{base}/aflevering/{id}"),
-                title: html_unescape(&title),
-                downloaded: is_downloaded(st, &id),
-            });
+        }
+
+        // Stop when a page adds nothing new or we've reached the reported total.
+        if episodes.len() == before {
+            break;
+        }
+        if let Some(t) = total {
+            if episodes.len() >= t {
+                break;
+            }
         }
     }
 
@@ -1000,13 +1065,25 @@ async fn resolve_series(st: &AppState, page_url: &str) -> Result<SeriesResp, Str
         series_title = "Serie".into();
     }
 
+    // More episodes exist than we prefetched if the site's total exceeds what we
+    // collected (we stopped at the page cap).
+    let truncated = total.is_some_and(|t| episodes.len() < t);
+
     log(format!(
-        "serie '{series_title}': {} afspeelbare afleveringen gevonden",
-        episodes.len()
+        "serie '{series_title}': {} afspeelbare afleveringen gevonden{}{}",
+        episodes.len(),
+        total.map(|t| format!(" (totaal {t})")).unwrap_or_default(),
+        if truncated {
+            format!(" — afgekapt op {} pagina's", st.cfg.series_max_pages)
+        } else {
+            String::new()
+        }
     ));
     Ok(SeriesResp {
         series_title,
         episodes,
+        total,
+        truncated,
     })
 }
 

@@ -83,6 +83,7 @@ the full ffmpeg stderr on failure), so you can always see what's going on.
 | `-M`, `--always-media`  | off            | Save every download to the media library, ignoring the UI "keep" toggle. |
 | `-g`, `--global-status` | off            | Show every client the same job list (default: per-client via a cookie). |
 | `-j`, `--max-concurrent`| `3`            | Max episodes downloaded at once (limits CloudFront rate-limiting).      |
+| `-p`, `--max-pages`     | `4`            | Series listing pages to prefetch (24 episodes each, so ~96 by default). |
 | `--no-date`             | (date on)      | Don't append the broadcast date `(YYYY-MM-DD)` to filenames.            |
 | `--no-metadata`         | (metadata on)  | Don't write episode metadata tags into the MP4.                         |
 | `-h`, `--help`          | —              | Show help.                                                              |
@@ -150,6 +151,14 @@ the series page and shows a **multi-select popup** of its episodes:
 
 - The server always appends `?alleenafspeelbaar=ja` when fetching the series, so
   only **playable** (downloadable, non-DRM) episodes are listed.
+- **Filters are honoured.** Any filter query params already on the pasted URL —
+  e.g. `?mediumtype=video&omroep=VPRO&persoon=Eric+van+den+Broek` — are kept, so
+  the popup lists exactly the filtered set you see on the site.
+- **Pages are walked, up to a cap.** The site paginates the listing at 24
+  episodes per page (`pagina=N`). The tool fetches up to `--max-pages` pages
+  (default 4 ≈ 96 episodes) so the popup stays responsive for shows with
+  thousands of episodes. When more exist, the popup header shows *eerste N van M*
+  and you can either narrow the URL with filters or raise `--max-pages`.
 - Click episodes to toggle them; **Shift-click** selects a contiguous range.
   **Alles selecteren** / **Niets** toggle everything, and a live counter shows
   how many of N are selected.

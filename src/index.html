@@ -337,9 +337,17 @@ async function openSeries(url) {
     list.appendChild(row);
   });
   const haveCount = data.episodes.filter(e => e.downloaded).length;
-  $('mTitle').textContent = haveCount
-    ? `Kies afleveringen — ${data.series_title} (${haveCount} al gedownload)`
-    : `Kies afleveringen — ${data.series_title}`;
+  const shown = data.episodes.length;
+  let suffix = '';
+  if (data.truncated) {
+    // Server prefetched only the first N pages; tell the user there are more and
+    // how to widen the selection (filter the URL, or raise --max-pages).
+    suffix = ` — eerste ${shown} van ${data.total}; verfijn de URL met filters of`
+           + ` verhoog --max-pages op de server voor meer`;
+  } else if (haveCount) {
+    suffix = ` (${haveCount} al gedownload)`;
+  }
+  $('mTitle').textContent = `Kies afleveringen — ${data.series_title}${suffix}`;
   lastIndex = -1;
   updateCount();
   $('backdrop').classList.add('show');
