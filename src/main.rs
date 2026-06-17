@@ -21,6 +21,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Semaphore;
 use tokio_util::io::ReaderStream;
 
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
@@ -28,6 +29,9 @@ const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 \
 const DEFAULT_ADDR: &str = "0.0.0.0:3380";
 const DEFAULT_MEDIA_DIR: &str = "media";
 const DEFAULT_CACHE_TTL: &str = "60m";
+/// Default number of episodes resolved/downloaded at once. Keeping this small
+/// avoids tripping CloudFront's rate limiting when a whole series is queued.
+const DEFAULT_MAX_CONCURRENT: usize = 3;
 /// Working directory for browser-bound downloads; subject to the cache TTL.
 const DOWNLOAD_DIR: &str = "downloads";
 
@@ -46,6 +50,8 @@ struct Config {
     include_date: bool,
     /// Write episode metadata (title/show/date/description) into the MP4 (default on).
     include_metadata: bool,
+    /// Maximum number of episodes downloaded at once.
+    max_concurrent: usize,
 }
 
 #[derive(Clone, Serialize)]
@@ -89,6 +95,8 @@ struct AppState {
     media_index: Arc<Mutex<HashMap<String, String>>>,
     /// Episode keys currently being downloaded, to skip duplicate concurrent jobs.
     active: Arc<Mutex<HashSet<String>>>,
+    /// Limits how many downloads run at once (CloudFront rate-limit protection).
+    sem: Arc<Semaphore>,
 }
 
 #[derive(Deserialize)]
@@ -139,6 +147,7 @@ async fn main() {
         if cfg.include_date { "aan" } else { "uit" },
         if cfg.include_metadata { "aan" } else { "uit" }
     ));
+    log(format!("max. gelijktijdige downloads: {}", cfg.max_concurrent));
     if cfg.cache_ttl_secs == 0 {
         log("cache TTL: uit — tijdelijke bestanden worden niet opgeruimd".to_string());
     } else {
@@ -174,6 +183,7 @@ async fn main() {
         cfg: cfg.clone(),
         media_index: Arc::new(Mutex::new(media_index)),
         active: Arc::new(Mutex::new(HashSet::new())),
+        sem: Arc::new(Semaphore::new(cfg.max_concurrent)),
     };
 
     if cfg.cache_ttl_secs > 0 {
@@ -227,6 +237,7 @@ fn parse_args() -> Config {
         series_folders: false,
         include_date: true,
         include_metadata: true,
+        max_concurrent: DEFAULT_MAX_CONCURRENT,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -236,6 +247,16 @@ fn parse_args() -> Config {
             "-f" | "--series-folders" => cfg.series_folders = true,
             "--no-date" => cfg.include_date = false,
             "--no-metadata" => cfg.include_metadata = false,
+            "-j" | "--max-concurrent" => {
+                let raw = next_value(&mut args, &a);
+                match raw.parse::<usize>() {
+                    Ok(n) if n >= 1 => cfg.max_concurrent = n,
+                    _ => {
+                        eprintln!("Ongeldige waarde voor {a}: '{raw}' (geef een getal >= 1).");
+                        std::process::exit(2);
+                    }
+                }
+            }
             "-t" | "--cache-ttl" => {
                 let raw = next_value(&mut args, &a);
                 match parse_duration(&raw) {
@@ -255,6 +276,7 @@ fn parse_args() -> Config {
                        -m, --media-dir <pad>        Map voor permanent bewaarde bestanden (standaard {DEFAULT_MEDIA_DIR})\n  \
                        -t, --cache-ttl <duur>       Bewaartijd tijdelijke downloads, bijv. 30m/2h/1d, 0=uit (standaard {DEFAULT_CACHE_TTL})\n  \
                        -f, --series-folders         Bewaar per programma in een eigen submap (<serie>/<aflevering>.mp4)\n  \
+                       -j, --max-concurrent <n>     Max. gelijktijdige downloads (standaard {DEFAULT_MAX_CONCURRENT})\n  \
                            --no-date                Voeg de uitzenddatum NIET toe aan de bestandsnaam (standaard wel)\n  \
                            --no-metadata            Schrijf GEEN metadata (titel/serie/datum/beschrijving) in de MP4 (standaard wel)\n  \
                        -h, --help                   Toon deze hulp"
@@ -461,7 +483,16 @@ async fn run_job(st: AppState, id: String, page_url: String, keep: bool) {
         return;
     }
 
+    // Limit concurrency so a whole-series burst doesn't trip CloudFront's rate
+    // limiting. Jobs wait here (showing "in wachtrij") until a slot frees up.
+    if st.sem.available_permits() == 0 {
+        set(&st, &id, |j| j.status = "In wachtrij…".into());
+    }
+    let permit = st.sem.clone().acquire_owned().await;
+
     run_pipeline(&st, &id, &page_url, &key, &cache, keep).await;
+
+    drop(permit);
     st.active.lock().unwrap().remove(&key);
 }
 
@@ -655,45 +686,63 @@ async fn resolve(
         .await
         .map_err(|e| format!("Pagina lezen mislukt: {e}"))?;
 
-    // The signed master URL is embedded in the page's JSON, with `&` escaped as &.
+    // Signed master URLs are embedded in the page's JSON (with `&` as &). A page
+    // can list several assets (e.g. a "dubbelaflevering"), and not every one is
+    // playable — some return 403. Collect the distinct candidates in page order.
     let re = Regex::new(
         r#"https://sk-video[^"\\]*\.m3u8\?[A-Za-z0-9_=~.%-]*(?:\\u0026[A-Za-z0-9_=~.%-]*)*"#,
     )
     .unwrap();
-    let signed = re
-        .find(&html)
-        .ok_or("Geen video-stream gevonden op deze pagina (DRM of geen aflevering?).")?
-        .as_str()
-        .replace("\\u0026", "&");
+    let mut seen = HashSet::new();
+    let candidates: Vec<String> = re
+        .find_iter(&html)
+        .map(|m| m.as_str().replace("\\u0026", "&"))
+        .filter(|u| seen.insert(u.split('?').next().unwrap_or(u).to_string()))
+        .collect();
+    if candidates.is_empty() {
+        return Err("Geen video-stream gevonden op deze pagina (DRM of geen aflevering?).".into());
+    }
+    log(format!("[{id}] stap 2/3: {} stream-kandida(a)t(en) gevonden", candidates.len()));
 
-    let master_plain = signed.split('?').next().unwrap_or(&signed).to_string();
-    log(format!("[{id}] stap 2/3: master gevonden: {master_plain}"));
+    // Try each candidate's CloudFront handshake (302 + Set-Cookie). A whole-series
+    // burst can also cause transient 403s, so make a few passes with a backoff.
+    let mut chosen: Option<(String, String)> = None;
+    let mut last_status = 0u16;
+    'outer: for attempt in 1..=3 {
+        for cand in &candidates {
+            let resp = client
+                .get(cand)
+                .send()
+                .await
+                .map_err(|e| format!("CDN-handshake mislukt: {e}"))?;
+            last_status = resp.status().as_u16();
 
-    // GET the signed URL → 302 + Set-Cookie carrying the CloudFront signed cookies.
-    let resp = client
-        .get(&signed)
-        .send()
-        .await
-        .map_err(|e| format!("CDN-handshake mislukt: {e}"))?;
-    log(format!(
-        "[{id}] CDN-handshake HTTP {}",
-        resp.status().as_u16()
-    ));
+            let mut parts = Vec::new();
+            for v in resp.headers().get_all(header::SET_COOKIE) {
+                if let Ok(s) = v.to_str() {
+                    let nv = s.split(';').next().unwrap_or("").trim();
+                    if nv.starts_with("CloudFront-") {
+                        parts.push(nv.to_string());
+                    }
+                }
+            }
 
-    let mut parts = Vec::new();
-    for v in resp.headers().get_all(header::SET_COOKIE) {
-        if let Ok(s) = v.to_str() {
-            let nv = s.split(';').next().unwrap_or("").trim();
-            if nv.starts_with("CloudFront-") {
-                parts.push(nv.to_string());
+            let master = cand.split('?').next().unwrap_or(cand).to_string();
+            if parts.is_empty() {
+                log(format!("[{id}] handshake HTTP {last_status} (poging {attempt}): {master}"));
+            } else {
+                log(format!("[{id}] handshake OK ({} cookies): {master}", parts.len()));
+                chosen = Some((master, parts.join("; ")));
+                break 'outer;
             }
         }
+        if attempt < 3 {
+            tokio::time::sleep(std::time::Duration::from_millis(400 * attempt as u64)).await;
+        }
     }
-    if parts.is_empty() {
-        return Err("Geen CloudFront-cookies ontvangen; URL mogelijk verlopen.".into());
-    }
-    log(format!("[{id}] {} CloudFront-cookies ontvangen", parts.len()));
-    let cookie = parts.join("; ");
+    let (master_plain, cookie) = chosen.ok_or_else(|| {
+        format!("Geen speelbare stream (laatste HTTP {last_status}); mogelijk DRM of snelheidslimiet.")
+    })?;
 
     let title = Regex::new(r"<title>([^<]*)</title>")
         .unwrap()

@@ -80,6 +80,7 @@ the full ffmpeg stderr on failure), so you can always see what's going on.
 | `-m`, `--media-dir`     | `media`        | Directory for permanently-kept ("save to server") files.               |
 | `-t`, `--cache-ttl`     | `60m`          | How long throwaway downloads survive before being purged. `0` disables. |
 | `-f`, `--series-folders`| off            | Store kept files in a per-program subfolder (`<series>/<episode>.mp4`). |
+| `-j`, `--max-concurrent`| `3`            | Max episodes downloaded at once (limits CloudFront rate-limiting).      |
 | `--no-date`             | (date on)      | Don't append the broadcast date `(YYYY-MM-DD)` to filenames.            |
 | `--no-metadata`         | (metadata on)  | Don't write episode metadata tags into the MP4.                         |
 | `-h`, `--help`          | —              | Show help.                                                              |
@@ -153,7 +154,14 @@ the series page and shows a **multi-select popup** of its episodes:
 - The **Permanent bewaren op de mediaserver** toggle in the popup applies to all
   selected episodes.
 - Confirming starts one independent download per selected episode; each gets its
-  own progress row and runs concurrently.
+  own progress row. At most `--max-concurrent` (default 3) download at a time —
+  the rest wait, showing *In wachtrij…* — so a large series doesn't hammer the
+  CDN and trip its rate limiting.
+
+Some episodes (e.g. a *dubbelaflevering*) advertise **more than one** stream
+asset on their page, and not all are playable — some return `403`. The resolver
+tries each candidate stream in turn and uses the first that authorises, so these
+no longer fail.
 
 Episodes that are **already downloaded** are shown greyed out with a
 *✓ al gedownload* badge and can't be re-selected (see
