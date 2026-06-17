@@ -81,6 +81,7 @@ the full ffmpeg stderr on failure), so you can always see what's going on.
 | `-t`, `--cache-ttl`     | `60m`          | How long throwaway downloads survive before being purged. `0` disables. |
 | `-f`, `--series-folders`| off            | Store kept files in a per-program subfolder (`<series>/<episode>.mp4`). |
 | `-M`, `--always-media`  | off            | Save every download to the media library, ignoring the UI "keep" toggle. |
+| `-g`, `--global-status` | off            | Show every client the same job list (default: per-client via a cookie). |
 | `-j`, `--max-concurrent`| `3`            | Max episodes downloaded at once (limits CloudFront rate-limiting).      |
 | `--no-date`             | (date on)      | Don't append the broadcast date `(YYYY-MM-DD)` to filenames.            |
 | `--no-metadata`         | (metadata on)  | Don't write episode metadata tags into the MP4.                         |
@@ -211,6 +212,22 @@ moved, using the page's title/series/date for the destination name).
 
 Jobs are tracked in memory; a kept file persists on disk regardless, while a
 cached file disappears from the job list when it is purged.
+
+### Job list & page refresh
+
+Job state lives on the server, so **refreshing the page no longer loses your
+running downloads** — on load the page calls `/api/jobs` and rebuilds the rows,
+resuming live progress for anything still in flight.
+
+Two scopes are available:
+
+- **Per-client (default)** — the first visit hands out a random `bl_client`
+  cookie, and each browser sees only the jobs it started.
+- **Global** (`--global-status` / `-g`) — every client shares one job list,
+  handy for a household media box where everyone watches the same queue.
+
+Completed/failed jobs stay in the list until the server restarts, so the list
+also doubles as recent history (with the download links preserved).
 
 ## Skipping already-downloaded episodes
 

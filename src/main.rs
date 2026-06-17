@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::{Path, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -54,6 +54,9 @@ struct Config {
     max_concurrent: usize,
     /// Always save to the media library, regardless of the per-job "keep" toggle.
     always_media: bool,
+    /// Show every client the same job list (global) instead of per-client
+    /// (scoped by a random cookie).
+    global_status: bool,
 }
 
 #[derive(Clone, Serialize)]
@@ -70,6 +73,10 @@ struct Job {
     /// On-disk path of the finished file (set on success). Not exposed to clients.
     #[serde(skip)]
     path: String,
+    /// Client cookie that started this job, for per-client status scoping. Empty
+    /// when global-status mode is on. Not exposed to clients.
+    #[serde(skip)]
+    owner: String,
 }
 
 impl Job {
@@ -84,6 +91,7 @@ impl Job {
             error: false,
             kept: false,
             path: String::new(),
+            owner: String::new(),
         }
     }
 }
@@ -150,6 +158,14 @@ async fn main() {
         if cfg.include_metadata { "aan" } else { "uit" }
     ));
     log(format!("max. gelijktijdige downloads: {}", cfg.max_concurrent));
+    log(format!(
+        "takenlijst: {}",
+        if cfg.global_status {
+            "globaal (alle clients zien dezelfde downloads)"
+        } else {
+            "per client (gescheiden via cookie)"
+        }
+    ));
     if cfg.cache_ttl_secs == 0 {
         log("cache TTL: uit — tijdelijke bestanden worden niet opgeruimd".to_string());
     } else {
@@ -197,6 +213,7 @@ async fn main() {
         .route("/api/config", get(config))
         .route("/api/series", post(series))
         .route("/api/download", post(start))
+        .route("/api/jobs", get(jobs))
         .route("/api/status/{id}", get(status))
         .route("/api/file/{id}", get(file))
         .with_state(state);
@@ -241,6 +258,7 @@ fn parse_args() -> Config {
         include_metadata: true,
         max_concurrent: DEFAULT_MAX_CONCURRENT,
         always_media: false,
+        global_status: false,
     };
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
@@ -249,6 +267,7 @@ fn parse_args() -> Config {
             "-m" | "--media-dir" => cfg.media_dir = next_value(&mut args, &a),
             "-f" | "--series-folders" => cfg.series_folders = true,
             "-M" | "--always-media" => cfg.always_media = true,
+            "-g" | "--global-status" => cfg.global_status = true,
             "--no-date" => cfg.include_date = false,
             "--no-metadata" => cfg.include_metadata = false,
             "-j" | "--max-concurrent" => {
@@ -281,6 +300,7 @@ fn parse_args() -> Config {
                        -t, --cache-ttl <duur>       Bewaartijd tijdelijke downloads, bijv. 30m/2h/1d, 0=uit (standaard {DEFAULT_CACHE_TTL})\n  \
                        -f, --series-folders         Bewaar per programma in een eigen submap (<serie>/<aflevering>.mp4)\n  \
                        -M, --always-media           Bewaar alles in de mediabibliotheek (negeer de 'bewaren'-vinkjes)\n  \
+                       -g, --global-status          Toon alle clients dezelfde takenlijst (standaard: per client via cookie)\n  \
                        -j, --max-concurrent <n>     Max. gelijktijdige downloads (standaard {DEFAULT_MAX_CONCURRENT})\n  \
                            --no-date                Voeg de uitzenddatum NIET toe aan de bestandsnaam (standaard wel)\n  \
                            --no-metadata            Schrijf GEEN metadata (titel/serie/datum/beschrijving) in de MP4 (standaard wel)\n  \
@@ -368,8 +388,46 @@ async fn cleanup_loop(st: AppState) {
 
 // ---- handlers -------------------------------------------------------------
 
-async fn index() -> Html<&'static str> {
-    Html(INDEX_HTML)
+async fn index(State(st): State<AppState>, headers: HeaderMap) -> Response {
+    let mut resp = Html(INDEX_HTML).into_response();
+    // In per-client mode, hand out a random cookie so this browser can be matched
+    // to its own jobs across refreshes. Global mode needs no cookie.
+    if !st.cfg.global_status && client_id(&headers).is_none() {
+        let cookie = format!(
+            "bl_client={}; Path=/; Max-Age=31536000; SameSite=Lax",
+            random_token()
+        );
+        if let Ok(v) = cookie.parse() {
+            resp.headers_mut().insert(header::SET_COOKIE, v);
+        }
+    }
+    resp
+}
+
+/// Read the `bl_client` cookie value from a request, if present.
+fn client_id(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::COOKIE)?
+        .to_str()
+        .ok()?
+        .split(';')
+        .filter_map(|kv| kv.trim().split_once('='))
+        .find(|(k, _)| *k == "bl_client")
+        .map(|(_, v)| v.to_string())
+}
+
+/// A random opaque token (128-bit, hex) used as a per-client cookie value.
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut s = String::with_capacity(32);
+    for _ in 0..2 {
+        // Each RandomState is seeded with fresh process randomness.
+        let h = std::collections::hash_map::RandomState::new()
+            .build_hasher()
+            .finish();
+        s.push_str(&format!("{h:016x}"));
+    }
+    s
 }
 
 /// Expose retention settings so the UI can label the "keep on server" option.
@@ -389,12 +447,17 @@ async fn series(State(st): State<AppState>, Json(req): Json<SeriesReq>) -> Respo
     }
 }
 
-async fn start(State(st): State<AppState>, Json(req): Json<DownloadReq>) -> Json<StartResp> {
+async fn start(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<DownloadReq>,
+) -> Json<StartResp> {
     // The server-wide --always-media flag forces every job to the media library.
     let keep = req.keep || st.cfg.always_media;
     let id = new_id();
     let mut job = Job::new();
     job.kept = keep;
+    job.owner = client_id(&headers).unwrap_or_default();
     st.jobs.lock().unwrap().insert(id.clone(), job);
 
     let st2 = st.clone();
@@ -414,6 +477,29 @@ async fn status(State(st): State<AppState>, Path(id): Path<String>) -> Response 
         Some(job) => Json(job.clone()).into_response(),
         None => (StatusCode::NOT_FOUND, "onbekende taak").into_response(),
     }
+}
+
+/// List the jobs visible to this client so the page can rehydrate after a
+/// refresh: all jobs in global mode, otherwise just this cookie's jobs. Each
+/// entry is the job plus its id, ordered oldest-first.
+async fn jobs(State(st): State<AppState>, headers: HeaderMap) -> Json<Vec<serde_json::Value>> {
+    let me = client_id(&headers).unwrap_or_default();
+    let global = st.cfg.global_status;
+    let jobs = st.jobs.lock().unwrap();
+    let mut list: Vec<(String, serde_json::Value)> = jobs
+        .iter()
+        .filter(|(_, j)| global || j.owner == me)
+        .map(|(id, j)| {
+            let mut v = serde_json::to_value(j).unwrap_or_default();
+            if let Some(obj) = v.as_object_mut() {
+                obj.insert("id".into(), serde_json::Value::String(id.clone()));
+            }
+            (id.clone(), v)
+        })
+        .collect();
+    // Job ids are time-ordered, so a lexicographic sort is roughly chronological.
+    list.sort_by(|a, b| a.0.cmp(&b.0));
+    Json(list.into_iter().map(|(_, v)| v).collect())
 }
 
 async fn file(State(st): State<AppState>, Path(id): Path<String>) -> Response {

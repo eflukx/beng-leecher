@@ -210,11 +210,35 @@ function makeRow(title) {
   return el;
 }
 
-function pollRow(row, id, keep) {
+// Render one job snapshot into a row (shared by live polling and rehydration).
+function applyJob(row, j, id, keep) {
   const status = row.querySelector('.job-status');
   const fill = row.querySelector('.fill');
   const msg = row.querySelector('.msg');
   const dl = row.querySelector('.done');
+
+  status.className = 'job-status';
+  status.textContent = j.status;
+  if (j.title) row.querySelector('.job-title').textContent = j.title;
+  fill.style.width = (j.progress || 0) + '%';
+  msg.className = 'msg';
+  msg.textContent = j.message || '';
+
+  if (j.done) {
+    if (j.error) {
+      status.className = 'job-status err';
+      fill.classList.add('err');
+    } else {
+      fill.style.width = '100%';
+      dl.href = '/api/file/' + id;
+      dl.textContent = keep ? '⬇ Ook lokaal opslaan' : '⬇ Bewaar bestand';
+      dl.style.display = 'inline-block';
+    }
+  }
+}
+
+function pollRow(row, id, keep) {
+  const msg = row.querySelector('.msg');
   let fails = 0;
 
   const timer = setInterval(async () => {
@@ -234,27 +258,29 @@ function pollRow(row, id, keep) {
       return;
     }
     fails = 0;
-    msg.className = 'msg';
-
-    status.textContent = j.status;
-    if (j.title) row.querySelector('.job-title').textContent = j.title;
-    fill.style.width = (j.progress || 0) + '%';
-    msg.textContent = j.message || '';
-
-    if (j.done) {
-      clearInterval(timer);
-      if (j.error) {
-        status.className = 'job-status err';
-        fill.classList.add('err');
-      } else {
-        fill.style.width = '100%';
-        dl.href = '/api/file/' + id;
-        dl.textContent = keep ? '⬇ Ook lokaal opslaan' : '⬇ Bewaar bestand';
-        dl.style.display = 'inline-block';
-      }
-    }
+    applyJob(row, j, id, keep);
+    if (j.done) clearInterval(timer);
   }, 600);
 }
+
+// On (re)load, repopulate rows for jobs the server still knows about so a
+// refresh doesn't lose active downloads.
+async function rehydrate() {
+  let list;
+  try {
+    const r = await fetch('/api/jobs');
+    if (!r.ok) return;
+    list = await r.json();
+  } catch (e) {
+    return;
+  }
+  for (const j of list) {           // oldest-first; prepend puts newest on top
+    const row = makeRow(j.title || j.filename || 'Aflevering');
+    applyJob(row, j, j.id, !!j.kept);
+    if (!j.done) pollRow(row, j.id, !!j.kept);
+  }
+}
+rehydrate();
 
 function rowFail(row, text) {
   const s = row.querySelector('.job-status');
